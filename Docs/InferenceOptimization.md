@@ -316,6 +316,86 @@ FlashAttention、融合 RMSNorm、融合反量化 GEMM 都是典型例子。
 
 ---
 
+## vLLM 相关
+
+### vLLM v0 vs v1 架构区别？
+
+**答：**
+
+| 维度 | v0 架构 | v1 架构 |
+|------|---------|---------|
+| **调度器** | Python 实现，单线程 | 重写的高性能调度器 |
+| **KV Cache 管理** | Python dict 的 Block Manager | 更高效的 C++ 实现 |
+| **Executor** | 同步执行 | 异步执行，更好的 overlap |
+| **性能** | 基准 | 显著提升（尤其高 QPS） |
+
+**v1 的关键改进：**
+- **异步调度**：调度器和执行器解耦，减少 CPU-GPU 等待
+- **更好的内存管理**：减少 Python GC 压力
+- **统一请求处理流程**：prefill 和 decode 走统一路径
+- **改进的 CUDA Graph 支持**：更灵活的 shape 适配
+
+### vLLM 的核心特性有哪些？
+
+**答：**
+
+| 特性 | 说明 |
+|------|------|
+| **PagedAttention** | OS 分页式 KV Cache 管理，消除显存碎片 |
+| **Continuous Batching** | Token 级动态调度，请求随时加入/退出 |
+| **Prefix Caching** | 自动复用相同前缀的 KV Cache（hash-based block matching） |
+| **Chunked Prefill** | 长 prompt 分块执行，避免长时间独占 GPU |
+| **CUDA Graph** | 捕获固定执行图，减少 decode 阶段 CPU overhead |
+| **Speculative Decoding** | 支持 draft model 投机解码 |
+| **Quantization** | 支持 AWQ、GPTQ、FP8 等 |
+| **TP/PP** | 张量并行和流水线并行 |
+
+---
+
+## SGLang 相关
+
+### 什么是 RadixAttention？与 vLLM 的 Prefix Caching 有什么区别？
+
+**答：**
+
+**RadixAttention** 是 SGLang 提出的基于 **Radix Tree（基数树）** 的 KV Cache 管理方案：
+
+- 把所有请求的 token 序列组织成一棵 Radix Tree
+- 共享前缀的请求自动共享 KV Cache 节点
+- 支持 LRU eviction 和动态增长
+
+```
+Radix Tree 示例:
+              [System Prompt]
+              /            \
+      [User: How]        [User: What]
+       /        \             |
+  [to cook]  [are you]   [is AI]
+```
+
+**与 vLLM Prefix Caching 的区别：**
+
+| 维度 | vLLM Prefix Caching | SGLang RadixAttention |
+|------|---------------------|----------------------|
+| 数据结构 | Hash-based block matching | Radix Tree |
+| 匹配粒度 | Block 级别 | Token 级别（更细） |
+| 前缀发现 | 需要显式匹配 | 自动通过树结构发现 |
+| 适用场景 | 前缀相对固定 | 复杂前缀模式（multi-turn, tree-of-thought） |
+
+**RadixAttention 更好在哪？** 可以自动发现和利用任意位置的共享前缀，不限于固定 system prompt。在多轮对话、few-shot、tree-of-thought 等复杂场景下能找到更多复用机会。
+
+### SGLang vs vLLM 简要对比
+
+| 维度 | vLLM | SGLang |
+|------|------|--------|
+| KV Cache 管理 | PagedAttention + Hash prefix | RadixAttention |
+| 调度器 | Python/C++ 混合 | 极轻量级 CPU scheduler |
+| 结构化生成 | 支持但较基础 | 深度优化（compressed FSM） |
+| 生态 | 更成熟，用户更多 | 更前沿，迭代快 |
+| 适合场景 | 通用 serving | Agent/structured output 场景 |
+
+---
+
 ## 面试金句
 
 > "Continuous Batching 的核心不是把 batch 做大，而是让 GPU 在每一轮 token 调度里都尽量保持高利用率。"

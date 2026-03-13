@@ -58,6 +58,44 @@
 
 因为 ZeRO 已经把参数分片了，每张卡只保存 1/N 的参数。用 Reduce-Scatter + All-Gather 可以直接得到分片后的梯度，无需额外的 Reduce 操作。
 
+### Reduce、Broadcast、AllToAll 分别是什么？
+
+**答：**
+
+| 原语 | 功能 | 图示 |
+|------|------|------|
+| **Reduce** | 所有节点数据聚合到一个节点（如求和） | `[A0][A1][A2] → GPU0: [∑A]` |
+| **Broadcast** | 一个节点的数据发送到所有节点 | `GPU0: [A] → [A][A][A]` |
+| **AllToAll** | 每个节点向每个其他节点发送不同数据 | MoE token routing 专用 |
+
+**AllToAll 详解（MoE/EP 核心通信）：**
+
+```
+GPU 0: [A→0, A→1, A→2]    AllToAll → GPU 0: [A→0, B→0, C→0]
+GPU 1: [B→0, B→1, B→2]    ────────→ GPU 1: [A→1, B→1, C→1]
+GPU 2: [C→0, C→1, C→2]              GPU 2: [A→2, B→2, C→2]
+```
+
+AllToAll 功能最灵活，但对网络和拓扑要求也最高。MoE 场景中，token 需要根据 router 结果被分发到不同 expert 所在的 GPU，频繁 AllToAll 很容易把网络打满。
+
+### 通信开销怎么估？
+
+**答：**
+
+**通信时间模型：** $T = \alpha + M / \beta$
+- $\alpha$：延迟（建立连接的固定开销）
+- $\beta$：带宽
+- $M$：数据量
+
+| 通信原语 | 数据量（N 节点） | 说明 |
+|---------|----------------|------|
+| **AllReduce** | $2 \times \frac{N-1}{N} \times M$ | = ReduceScatter + AllGather |
+| **AllGather** | $\frac{N-1}{N} \times M$ | 每个节点收集其余所有分片 |
+| **ReduceScatter** | $\frac{N-1}{N} \times M$ | 聚合后分发到各节点 |
+| **AllToAll** | 取决于路由模式 | MoE token routing |
+
+**关键公式：AllReduce = ReduceScatter + AllGather**
+
 ---
 
 ## 通信成为瓶颈的原因

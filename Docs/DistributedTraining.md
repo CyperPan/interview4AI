@@ -92,6 +92,51 @@ GPU1:      [F1][F2][B1][F3][B2][F4][B3][B4]
 
 ---
 
+## Expert Parallelism（EP / 专家并行）
+
+### 什么是专家并行？它和 TP/PP 有什么区别？
+
+**答：**
+
+**EP 专用于 MoE 模型**，把不同的 expert 分配到不同的 GPU。
+
+```
+GPU 0: Expert 0, 1, 2, 3
+GPU 1: Expert 4, 5, 6, 7
+
+Token routing:
+Token A → Expert 2 (GPU 0) + Expert 5 (GPU 1)  ← AllToAll
+Token B → Expert 0 (GPU 0) + Expert 7 (GPU 1)  ← AllToAll
+```
+
+| 维度 | TP | PP | EP |
+|------|----|----|-----|
+| 切分对象 | 同一层权重 | 不同层 | 不同 expert |
+| 通信原语 | AllReduce | P2P Send/Recv | AllToAll |
+| 适用模型 | Dense 和 MoE | Dense 和 MoE | **仅 MoE** |
+| 通信频率 | 每层 | 每 stage | 每个 MoE 层 |
+
+### 在 vLLM 中如何实现各种并行？
+
+**答：**
+
+| 并行方式 | vLLM 实现 | 使用方式 |
+|---------|----------|---------|
+| **DP** | 多 worker 进程，各加载完整模型，请求负载均衡分发 | 模型单卡能放下时首选，零通信开销 |
+| **TP** | `--tensor-parallel-size N`，自动切分 QKV/FFN 权重，NCCL AllReduce 同步 | 需要 NVLink 高带宽互连 |
+| **PP** | `--pipeline-parallel-size N`，不同层分配到不同卡，micro-batching 减少 bubble | 适合跨机部署 |
+| **EP** | 与 TP 结合，MoE 层自动做 expert 分片和 token 路由 | MoE 模型使用 |
+
+**选型经验法则：**
+- 模型单卡能放下 → **DP**
+- 需要 2-8 卡（机内） → **TP**
+- 需要跨机 → TP（机内）+ PP（跨机）
+- MoE 模型 → TP + EP
+
+**推理和训练并行的区别：** 推理 batch 小、延迟敏感，首选 DP > TP > PP；训练关心总吞吐和显存，常用 3D 并行（DP+TP+PP）。
+
+---
+
 ## 3D 混合并行策略
 
 ### 如果让你为一个超大模型设计并行策略，你会如何在 DP、TP、PP 之间做权衡？

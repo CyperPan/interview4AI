@@ -221,6 +221,61 @@ public:
 - **训练：** BF16 更稳定，FP16 需配合 Loss Scaling
 - **推理：** 两者皆可，BF16 更适合对数值敏感的场景
 
+### 3.5 LLM.int8() 的原理是什么？
+
+**答：**
+
+**核心思想：** 混合精度分解，将 outlier（异常大值）单独用 FP16 处理。
+
+1. 按列检测激活中的 outlier（绝对值 > 阈值，如 6.0）
+2. Outlier 列用 FP16 精度计算
+3. 非 outlier 列用 INT8 量化计算
+4. 两部分结果相加
+
+```
+X @ W = X_outlier @ W_outlier (FP16) + X_normal @ W_normal (INT8)
+```
+
+- ✅ 几乎零精度损失的 INT8 推理
+- ❌ 需要动态检测 outlier，增加实现复杂度；混合精度会降低 Tensor Core 利用率
+
+### 3.6 AWQ（Activation-aware Weight Quantization）的原理？
+
+**答：**
+
+**核心思想：** 不是所有权重都同等重要，保护"重要"权重。
+
+1. 通过校准数据统计每个权重通道对应的激活幅度
+2. 激活幅度大的通道 → 对应权重更重要 → 量化时给更大的 scale
+3. 等价变换：`W_q = Quantize(W * s) / s`，s 基于激活幅度搜索最优值
+
+- ✅ Weight-only 量化（W4A16），适合极致压缩权重、省显存
+- ❌ 只量化权重，激活仍是 FP16
+
+### 3.7 GPTQ 的原理？
+
+**答：**
+
+**核心思想：** 基于二阶信息（Hessian 近似）的逐层权重量化。
+
+1. 逐层处理：对每一层的权重矩阵做量化
+2. 逐列量化：量化一列后，用 Hessian 信息补偿其他列的误差
+3. 目标：最小化量化后的输出误差 $||WX - \hat{W}X||^2$
+4. 利用 OBS（Optimal Brain Surgeon）的近似方法
+
+- ✅ 量化精度高（尤其 4-bit），一次量化多次推理
+- ❌ 量化过程较慢（需逐层优化），需要校准数据
+
+### 3.8 量化方案对比
+
+| 方法 | 类型 | 量化对象 | 精度 | 适用场景 |
+|------|------|---------|------|---------|
+| **LLM.int8()** | PTQ | W8A8（mixed） | 高 | 零损失推理，但速度一般 |
+| **SmoothQuant** | PTQ | W8A8 | 高 | INT8 全量化，追求吞吐 |
+| **AWQ** | PTQ | W4A16 | 较高 | 极致压缩权重，省显存 |
+| **GPTQ** | PTQ | W4A16 / W3A16 | 较高 | 离线量化，追求低 bit 精度 |
+| **FP8** | PTQ/QAT | W8A8 (FP8) | 高 | Hopper 原生支持，部署自然 |
+
 ### 4. 在实际工程中，量化如何平衡「精度」和「速度/显存」？
 
 **答：**
@@ -312,6 +367,100 @@ cudaError_t cudaMalloc(void** devPtr, size_t size) {
 }
 ```
 
+### 2.5 GPU 线程层次结构：Grid / Block / Thread / Warp
+
+**答：**
+
+```
+Grid（网格）
+├── Block 0（线程块 / CTA）
+│   ├── Warp 0: Thread 0~31
+│   ├── Warp 1: Thread 32~63
+│   └── ...
+├── Block 1
+│   └── ...
+└── ...
+```
+
+| 概念 | 说明 |
+|------|------|
+| **Thread** | GPU 最小执行单元，每个 thread 执行相同的 kernel 代码 |
+| **Warp** | 32 个连续 thread 组成，**SIMT 执行的基本单位**，warp 内 thread 执行相同指令 |
+| **Block（CTA）** | 多个 warp 组成，共享 Shared Memory，在一个 SM 上执行，block 内可同步（`__syncthreads()`） |
+| **Grid** | 所有 block 的集合，对应一次 kernel launch |
+
+**高频追问：**
+- **Warp divergence**：同一 warp 内 thread 走不同 if/else 分支 → GPU 串行执行两个分支，浪费算力
+- **一个 block 最多 1024 个 thread**，实际要根据 register 和 shared memory 用量考虑 occupancy
+- **一个 block 完整运行在一个 SM 上**，一个 SM 可以同时运行多个 block
+
+### 2.6 GPU 存储层次结构：L0/L1/L2/Global Memory、SRAM/HBM
+
+**答：**
+
+```
+┌────────────────────────────────────────────┐
+│              Global Memory (HBM)            │  ← 容量大(80GB)，带宽 3.35TB/s，延迟 ~400 cycles
+│  ┌──────────────────────────────────────┐  │
+│  │           L2 Cache (SRAM)             │  │  ← 全 GPU 共享，50MB (H100)
+│  │  ┌────────────────────────────────┐  │  │
+│  │  │  Per-SM: L1 Cache /            │  │  │  ← 每个 SM 私有
+│  │  │  Shared Memory (SRAM)          │  │  │  ← 可配置划分，延迟 ~20-30 cycles
+│  │  │  ┌──────────────────────────┐  │  │  │
+│  │  │  │   Register File          │  │  │  │  ← 每个 thread 私有，延迟 ~1 cycle
+│  │  │  │   L0 Instruction Cache   │  │  │  │  ← Warp scheduler 指令缓存
+│  │  │  └──────────────────────────┘  │  │  │
+│  │  └────────────────────────────────┘  │  │
+│  └──────────────────────────────────────┘  │
+└────────────────────────────────────────────┘
+```
+
+| 存储层级 | 位置 | 容量 | 延迟 | 作用域 |
+|---------|------|------|------|--------|
+| **Register** | SM 内 | 每 SM 256KB | ~1 cycle | Thread 私有 |
+| **L0 Instruction Cache** | SM 内 | 小 | 极低 | Warp scheduler 用 |
+| **L1 / Shared Memory** | SM 内（SRAM） | ~192-256KB/SM | ~20-30 cycles | Block 内共享（Shared Memory）或自动缓存（L1） |
+| **L2 Cache** | 全芯片（SRAM） | ~50MB (H100) | ~200 cycles | 全 GPU 共享 |
+| **Global Memory (HBM)** | 芯片外 | 80GB (H100) | ~400 cycles | 全 GPU + Host 可访问 |
+
+**SRAM vs HBM 核心区别：**
+- **SRAM**（L1/Shared/L2）：on-chip，速度极快（数十 TB/s），容量极小（KB~MB）
+- **HBM**（Global Memory）：off-chip，速度相对慢（几 TB/s），容量大（数十 GB）
+- **FlashAttention 的核心就是让 attention 中间结果留在 SRAM 中，避免写回 HBM**
+
+### 2.7 Tensor Core
+
+**答：**
+
+Tensor Core 是 GPU 中专门用于矩阵乘加（MMA）的硬件单元，每个时钟周期可完成一个小矩阵乘法。
+
+| 架构 | 支持精度 | 说明 |
+|------|---------|------|
+| Volta (V100) | FP16 | 首次引入 Tensor Core |
+| Ampere (A100) | FP16, BF16, TF32, INT8, INT4 | 扩展精度支持 |
+| Hopper (H100) | 增加 FP8 | 990 TFLOPS (BF16) vs 67 TFLOPS (FP32 CUDA Core) |
+| Blackwell (B200) | FP4, FP6 等 | 更多低精度支持 |
+
+**为什么 Tensor Core 对 decode 帮助有限？** 因为 decode（batch=1）做的是 GEMV（矩阵×向量），规模太小无法喂满 Tensor Core。Tensor Core 在大规模 GEMM（如 prefill）中收益更大。
+
+### 2.8 TMA（Tensor Memory Accelerator）
+
+**答：**
+
+TMA 是 Hopper 架构引入的硬件单元，在 HBM 和 Shared Memory 之间高效搬运多维张量。
+
+**核心能力：**
+- 支持多维张量的**异步拷贝**（不阻塞 SM 计算）
+- 自动处理地址计算、边界检查、padding
+- 支持 multicast（一次读取分发给多个 SM）
+
+```
+传统方式：Thread 手动计算地址 → 发起 load → 等待 → SM 大量时间浪费在地址计算和等待上
+TMA 方式：TMA 单元接收描述符 → 自动搬运整块数据到 Shared Memory → 计算与搬运完全 overlap
+```
+
+**FlashAttention-3 利用 TMA 实现更高效的 tiling，让 SM 专注于计算。**
+
 ### 3. 为了优化 CUDA 程序的访存效率，你可以想到哪些手段？
 
 **答：**
@@ -342,20 +491,41 @@ cudaError_t cudaMalloc(void** devPtr, size_t size) {
 
 ## 大模型理论与推理优化
 
-### 1. 说出你知道的典型 encoder-only / decoder-only / encoder-decoder 结构的模型
+### 1. 说出你知道的典型 encoder-only / decoder-only / encoder-decoder 结构的模型，各自优缺点
 
 **答：**
 
-| 架构 | 代表模型 | 特点 |
-|-----|---------|------|
-| **Encoder-only** | BERT、RoBERTa | 双向注意力，适合理解任务 |
-| **Decoder-only** | GPT、LLaMA、Qwen | 自回归生成，适合生成任务 |
-| **Encoder-Decoder** | T5、BART | 编码器+解码器，适合翻译/摘要 |
+| 架构 | 代表模型 | Attention 类型 | 典型任务 |
+|-----|---------|---------------|---------|
+| **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa | 双向（Bidirectional）全注意力 | 文本分类、NER、句子相似度 |
+| **Decoder-only** | GPT 系列, LLaMA, Qwen, DeepSeek | 因果（Causal）单向注意力 | 文本生成、对话、代码补全 |
+| **Encoder-Decoder** | T5, BART, mBART, Flan-T5 | Encoder 双向 + Decoder 因果 + Cross Attention | 翻译、摘要、问答 |
 
-**LLM Serving 主要是 Decoder-only：**
-- 自回归生成是逐 token 的
-- 需要 KV Cache 优化
-- Continuous Batching 等优化都是针对 Decoder
+**Encoder-only 优缺点：**
+- ✅ 双向上下文建模能力强，适合理解类任务；模型相对较小，推理快
+- ❌ 不擅长生成任务（没有自回归机制）；在生成式 AI 浪潮中逐渐被取代
+
+**Decoder-only 优缺点：**
+- ✅ 天然适合自回归生成，scaling law 表现最好；涌现能力（ICL, CoT）主要在此架构上观察到
+- ❌ 单向注意力在纯理解任务上不如双向模型；长序列 KV Cache 显存线性增长
+
+**Encoder-Decoder 优缺点：**
+- ✅ 输入输出可以有不同长度和结构，天然适合 seq2seq 任务；Encoder 做理解、Decoder 做生成，分工明确
+- ❌ 架构更复杂，参数效率不如 decoder-only；scaling 方面不如 decoder-only 有优势
+
+**为什么 Decoder-only 成了主流：**
+1. Scaling law 在 decoder-only + next-token prediction 上表现最好
+2. 统一的自回归范式可以同时处理理解和生成
+3. 工程上 KV Cache、continuous batching 等优化都是针对 decoder-only 设计
+
+| 维度 | Encoder-only | Decoder-only | Encoder-Decoder |
+|------|-------------|-------------|----------------|
+| 生成能力 | 弱 | 强 | 强 |
+| 理解能力 | 强 | 中等（大模型后追上来了） | 强 |
+| Scaling 表现 | 一般 | 最好 | 一般 |
+| KV Cache | 不需要 | 需要 | Encoder KV + Decoder KV |
+| 推理优化生态 | 较少 | 最成熟 | 中等 |
+| 当前主流地位 | 衰退 | 绝对主流 | 衰退 |
 
 ### 2. 随着序列长度增加，encoder-only 和 decoder-only 模型的计算量与访存量变化趋势
 
@@ -434,6 +604,52 @@ SRAM: 每次处理小块，在 SRAM 内完成所有计算
 1. **减少 HBM 访问** - 从 O(N²d) 降到 O(N²d²/M)（M 为 SRAM 大小），不需要将 N×N 注意力矩阵写回 HBM
 2. **节省显存** - 不需要存储中间注意力矩阵
 3. **速度提升** - HBM 带宽不再是瓶颈
+
+### 5.5 FlashAttention v1 → v2 → v3 的演进
+
+**答：**
+
+**FlashAttention v2 改进（在 v1 基础上）：**
+- **更好的并行化**：外层循环改为遍历 Q blocks（v1 是遍历 K/V blocks），每个 Q block 结果在 SRAM 中累积完后一次性写回，减少 HBM 读写
+- **减少非矩阵乘 FLOPs**：优化 softmax 统计量更新，减少 warp 间同步
+- **更好的 work partitioning**：在 warp 之间更均匀分配工作
+- 速度比 v1 快约 **2x**，达到理论 FLOPS 的 50-73%
+
+**FlashAttention v3 改进（面向 Hopper 架构）：**
+- **利用 TMA**：用 Tensor Memory Accelerator 做异步数据搬运，解放 SM
+- **Warp Specialization**：不同 warp 分别负责数据加载和计算，流水线化
+- **FP8 支持**：原生支持 FP8 精度
+- **Ping-pong scheduling**：双缓冲调度，让 TMA 加载和 WGMMA 计算完全重叠
+- 在 H100 上比 v2 快约 **1.5-2x**
+
+| 维度 | FA v1 | FA v2 | FA v3 |
+|------|-------|-------|-------|
+| 核心思想 | Tiling + Online Softmax | 更好的并行化 | Hopper 硬件特性利用 |
+| 目标硬件 | A100 | A100/H100 | H100 (Hopper) |
+| 数据搬运 | Thread 手动加载 | Thread 手动加载 | TMA 异步搬运 |
+| FP8 支持 | 无 | 无 | 有 |
+| 相对速度 | 1x | ~2x | ~3-4x |
+
+**总结：v1→v2 是算法层面改进（更好的并行化），v2→v3 是硬件层面利用（TMA、Warp Specialization）。**
+
+### 5.6 什么是 FlashDecoding？
+
+**答：**
+
+**问题：** FlashAttention 并行维度是 batch × head × Q_block。Decode 阶段 Q 只有 1 个 token，如果 batch 小、head 少，并行度不足以喂满 GPU。
+
+**FlashDecoding 做法：** 在 **KV sequence 维度** 上增加并行。
+
+```
+传统 decode attention: 一个 thread block 串行遍历整个 KV 序列
+
+FlashDecoding: 将 K/V 序列切成多个分片 → 每个分片由不同 thread block 并行处理
+→ 每个分片独立计算 partial softmax 和 partial output
+→ 最后一次 reduction 合并（用 online softmax 技巧保证数值正确）
+```
+
+- 长序列 decode 速度提升 **8x+**
+- 特别适合 long context + small batch 场景
 
 ### 6. 请讲讲 PagedAttention 的原理？为什么它能极大提升推理速度？与 FlashAttention 的本质区别？
 
