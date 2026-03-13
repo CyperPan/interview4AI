@@ -4,15 +4,9 @@
 
 ---
 
-## 先纠正推理过程
 
-你给出的 `prefill -> attention -> moe -> decode -> 投机采样 -> output` 这个顺序不完全准确，主要有三个问题：
 
-1. **Attention 不是独立阶段**，它是 Transformer layer 内部的一部分，在 prefill 和 decode 里都会执行。
-2. **MoE 也不是所有模型都有的单独阶段**，它本质上是 FFN 的一种稀疏替代结构，也属于 layer 内部计算。
-3. **投机解码是可选加速分支，不是所有系统的必经路径**；真正必经的是 `sampling / constrained decoding / stream output`。
-
-更合理的在线 LLM 推理链路可以整理成：
+在线 LLM 推理链路可以整理成：
 
 1. **请求进入与 Tokenization**
 2. **调度与 Batching**
