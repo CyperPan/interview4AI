@@ -186,6 +186,42 @@
 
 ---
 
+## 第七点五部分：高级推理优化
+
+### 43. CUDA Graph 在推理中有什么用？
+
+> **CUDA Graph** 把 decode 阶段相对固定的 GPU 执行图 capture 下来复用，减少每步 CPU 发射 kernel 的开销和调度抖动。它的重要性在于 decode 阶段 kernel 数量多但每个 kernel 计算量小，CPU 侧 launch overhead 占比很高。trade-off 是：对动态 shape 不友好，prefill 阶段因为 prompt 长度不固定通常无法使用。
+
+### 44. KV Cache 量化解决什么问题？
+
+> **KV Cache 量化** 是把缓存的 K/V 张量从 FP16/BF16 压缩到 FP8 或 INT8，以减少长上下文场景下的显存占用和访存带宽。它的重要性在于 128K 上下文下 KV Cache 可能占到几十 GB，远超模型权重本身。trade-off 是：需要 per-channel 或 per-token 的 scale 策略来保持精度，且硬件需要支持对应的低精度读取。
+
+### 45. 长上下文推理（128K+）的主要挑战是什么？
+
+> 三个维度：**KV Cache 显存线性爆炸**、**Attention 计算量 O(n²) 二次增长**、**位置编码外推能力有限**。它的重要性在于长上下文是当前 LLM 产品的核心竞争力之一。trade-off 是：解决方案（FlashAttention、Ring Attention、KV 量化、RoPE 外推）各自有计算、通信或精度代价，需要组合使用。
+
+### 46. 推理中 TP 和 PP 怎么选？
+
+> **TP** 切同一层权重到多卡，延迟低但通信频繁，适合机内 NVLink；**PP** 切不同层到不同卡，通信少但有 pipeline bubble，适合跨机。推理中优先 TP，因为推理 batch 小、延迟敏感，PP 的 bubble 占比更大。trade-off 是：能用 DP（模型副本）的场景优先 DP，因为零通信开销。
+
+### 47. FlashAttention 的核心原理是什么？
+
+> FlashAttention 通过 **tiling + online softmax** 把 Q/K/V 分块加载到 SRAM 计算，避免 materialze O(N²) 的 attention 矩阵到 HBM。它的重要性在于同时省显存（不存 N×N 矩阵）和提速（减少 HBM 读写）。trade-off 是：实现复杂，对 head dim 和硬件敏感，FlashAttention-2/3 在不断改进调度和并行策略。
+
+### 48. Temperature 采样的数学本质是什么？
+
+> Temperature 把 logits 除以 T 再做 softmax：`p_i = exp(z_i/T) / Σ exp(z_j/T)`。T<1 让分布更尖锐（更确定），T>1 让分布更平坦（更随机），T→0 退化为 argmax，T→∞ 退化为均匀分布。它的重要性在于直接控制输出多样性。trade-off 是：T 太低会重复，T 太高会胡说，通常需要和 top-p/top-k 配合使用。
+
+### 49. Perplexity 和 Cross Entropy 的关系？
+
+> **Perplexity = exp(Cross Entropy)**，即 `PPL = exp(-1/N Σ log p(x_i|x_{<i}))`。它的重要性在于 PPL 是评估语言模型质量的标准指标，越低越好。trade-off 是：PPL 不能完全代表生成质量，低 PPL 不等于输出更好用，但它仍然是最通用的基准指标。
+
+### 50. RoPE 为什么适合推理？
+
+> RoPE 把位置信息编码进 Q/K 向量本身，使得 QK 点积自然包含相对位置信息。它的重要性在于 KV Cache 中的 K 已经带有位置信息，不需要因为绝对位置变化而重新计算，天然支持 prefix caching 和 KV 复用。trade-off 是：超出训练长度的外推能力有限，需要 NTK-aware scaling 或 YaRN 等技术扩展。
+
+---
+
 ## 第八部分：框架对比
 
 ### 39. vLLM 的关键词怎么背？

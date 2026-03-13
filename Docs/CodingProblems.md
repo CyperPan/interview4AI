@@ -340,30 +340,48 @@ class SimpleMoE(nn.Module):
         )
 
     def forward(self, x):
-        router_logits = self.router(x)
+        # x: (batch, seq_len, d_model) 或 (num_tokens, d_model)
+        orig_shape = x.shape
+        x_flat = x.view(-1, orig_shape[-1])  # (num_tokens, d_model)
+
+        router_logits = self.router(x_flat)  # (num_tokens, n_experts)
         router_probs = F.softmax(router_logits, dim=-1)
         topk_probs, topk_idx = torch.topk(router_probs, k=self.top_k, dim=-1)
+        # topk_probs, topk_idx: (num_tokens, top_k)
 
-        output = torch.zeros_like(x)
+        # 归一化 top-k 权重
+        topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
+
+        output = torch.zeros_like(x_flat)
         for expert_id, expert in enumerate(self.experts):
-            selected = (topk_idx == expert_id)
-            if not selected.any():
+            # 找出哪些 token 被路由到了这个 expert
+            mask = (topk_idx == expert_id)  # (num_tokens, top_k)
+            if not mask.any():
                 continue
 
-            weights = torch.where(
-                selected, topk_probs, torch.zeros_like(topk_probs)
-            ).sum(dim=-1, keepdim=True)
-            output = output + expert(x) * weights
+            # 找到被选中的 token 索引
+            token_mask = mask.any(dim=-1)  # (num_tokens,)
+            selected_tokens = x_flat[token_mask]  # 只取被选中的 token
 
+            # 只对被选中的 token 做 expert forward
+            expert_out = expert(selected_tokens)
+
+            # 取对应权重并加权
+            weights = torch.where(
+                mask[token_mask], topk_probs[token_mask], torch.zeros_like(topk_probs[token_mask])
+            ).sum(dim=-1, keepdim=True)
+            output[token_mask] += expert_out * weights
+
+        output = output.view(orig_shape)
         return output, topk_idx, topk_probs
 ```
 
 **代码讲解：**
 
 1. 这份实现先算 router 概率，再用 `topk` 找每个 token 该去哪些 expert。
-2. 为了面试时容易讲，这里没有真的把 token 重排到不同 expert buffer，而是用最直接的写法表达“只有被选中的 expert 对输出有贡献”。
+2. 关键：通过 `token_mask` 筛选出被路由到该 expert 的 token，**只对这些 token 做 expert forward**，而不是让所有 token 都过每个 expert。
 3. 如果面试官继续追问性能，你就顺着讲真实系统会做 token dispatch、专家并行、AllToAll 和负载均衡。
-4. 这题最容易失分的地方，是把 `MoE` 写成“所有 expert 都算一遍再加权”，那样结构上就不对了。
+4. 这题最容易失分的地方，是把 `MoE` 写成”所有 expert 都算一遍再加权”，那样结构上就不对了——一定要体现稀疏激活。
 
 ---
 

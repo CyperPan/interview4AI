@@ -87,7 +87,7 @@ GPU1:      [F1][F2][F3][F4]      [B4][B3][B2][B1]
 1F1B 调度：
 GPU0: [F1][F2][B1][F3][B2][F4][B3]   [B4]
 GPU1:      [F1][F2][B1][F3][B2][F4][B3][B4]
-            几乎没有 Bubble
+            Bubble 大幅减少（startup/drain 阶段仍有少量 bubble）
 ```
 
 ---

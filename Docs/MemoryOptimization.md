@@ -36,25 +36,28 @@ GPU3: [完整参数]             GPU3: [参数切片 3]
 
 **答：**
 
-| Stage | 分片内容 | 显存节省 |
+| Stage | 分片内容 | 显存节省（N 卡时） |
 |-------|---------|---------|
-| **Stage 1** | 优化器状态 (Optimizer States) | 4x |
-| **Stage 2** | 优化器状态 + 梯度 (Gradients) | 8x |
-| **Stage 3** | 优化器状态 + 梯度 + 参数 (Parameters) | 与数据并行度线性相关 |
+| **Stage 1** | 优化器状态 (Optimizer States) | 优化器状态部分被 N 卡均摊（N 足够大时最多约 4x） |
+| **Stage 2** | 优化器状态 + 梯度 (Gradients) | 优化器+梯度被均摊（N 足够大时最多约 8x） |
+| **Stage 3** | 优化器状态 + 梯度 + 参数 (Parameters) | 全部状态被 N 卡均摊，显存 ≈ 16/N bytes/参数 |
 
 **详细说明：**
 
 ```
-模型状态组成（以 Adam 优化器为例）：
-- 参数 (Parameters): 2 bytes (FP16) 或 4 bytes (FP32)
-- 梯度 (Gradients): 2 bytes (FP16) 或 4 bytes (FP32)
-- 优化器状态: 8 bytes (FP32 拷贝 + momentum + variance)
+混合精度训练的模型状态组成（以 Adam 优化器为例）：
+- FP16 参数 (Parameters): 2 bytes
+- FP16 梯度 (Gradients): 2 bytes
+- 优化器状态（共 12 bytes）:
+  - FP32 Master Copy: 4 bytes
+  - FP32 Momentum (一阶动量): 4 bytes
+  - FP32 Variance (二阶动量): 4 bytes
 
-总显存 = 参数 + 梯度 + 优化器状态 ≈ 16 bytes / 参数
+总显存 = 2 + 2 + 12 = 16 bytes / 参数
 
 ZeRO-3 分片后：
-- 每张卡只存 1/N 的参数
-- 显存 = 16/N bytes / 参数
+- 每张卡只存 1/N 的全部状态
+- 显存 ≈ 16/N bytes / 参数
 ```
 
 ---
@@ -85,7 +88,7 @@ ZeRO-3 分片后：
 
 **Trade-off：**
 - 以 ~33% 的额外计算时间
-- 换取指数级的显存节省
+- 将激活显存从 O(L) 降至 O(√L)（L 为层数），显著节省显存
 
 ---
 

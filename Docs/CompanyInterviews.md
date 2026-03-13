@@ -47,16 +47,16 @@ Output → Linear + Softmax
 
 **答：**
 
-**参数分布：**
+**参数分布（以 LLaMA-7B 等主流大模型为例）：**
 
 | 模块 | 参数量占比 | 说明 |
 |-----|-----------|------|
-| **Embedding** | ~20% | 词表 × 维度 |
-| **Attention** | ~10% | Q/K/V/O 投影矩阵 |
-| **FFN** | ~60% | 两个大矩阵 (4d × d) |
-| **LayerNorm** | ~1% | 可忽略 |
+| **Embedding** | ~2-5% | 词表 × 维度（大模型中占比很小，小模型中占比较大） |
+| **Attention** | ~30-33% | Q/K/V/O 四个投影矩阵，每层 4d² |
+| **FFN** | ~60-67% | 标准 FFN 两个矩阵 8d²；SwiGLU 三个矩阵但 d_ff 缩小 |
+| **LayerNorm/RMSNorm** | <1% | 可忽略 |
 
-**参数量最大：FFN**（约占总参数 60-70%）
+**参数量最大：FFN**（约占 Transformer 层参数的 2/3，因为 Attention 4d² vs FFN 8d²）
 
 **计算量最大：**
 - **Prefill**：Attention（O(n²) 复杂度）
@@ -71,7 +71,7 @@ Output → Linear + Softmax
 | GPU | CUDA Cores | Tensor Cores | 显存 | 显存带宽 |
 |-----|-----------|--------------|------|---------|
 | **A100** | 6912 | 3rd Gen | 40/80 GB | 2039 GB/s |
-| **H100** | ~15000 | 4th Gen | 80 GB | 3350 GB/s |
+| **H100** | 16896 | 4th Gen | 80 GB | 3350 GB/s |
 | **4090** | 16384 | 4th Gen | 24 GB | 1008 GB/s |
 
 **CUDA Core**：通用浮点运算单元
@@ -119,7 +119,7 @@ Output → Linear + Softmax
 ListNode* reverseKGroup(ListNode* head, int k) {
     ListNode dummy(0, head);
     ListNode* prev = &dummy;
-    
+
     while (true) {
         // 检查是否还有 k 个节点
         ListNode* tail = prev;
@@ -127,24 +127,25 @@ ListNode* reverseKGroup(ListNode* head, int k) {
             tail = tail->next;
         }
         if (!tail) break;
-        
+
         // 翻转这 k 个节点
         ListNode* next_group = tail->next;
-        ListNode* p = prev->next;
-        ListNode* q = tail->next;
-        
-        // 头插法翻转
-        while (p != q) {
-            ListNode* next = p->next;
-            p->next = prev->next;
-            prev->next = p;
-            p = next;
+        ListNode* group_first = prev->next;  // 翻转前的第一个节点，翻转后变成最后一个
+        ListNode* curr = group_first->next;
+
+        // 头插法翻转：把 curr 不断插到 prev 后面
+        while (curr != next_group) {
+            ListNode* next = curr->next;
+            curr->next = prev->next;
+            prev->next = curr;
+            curr = next;
         }
-        
-        prev->next->next = next_group;
-        prev = tail;
+
+        // group_first 现在是翻转后的尾节点，连接下一组
+        group_first->next = next_group;
+        prev = group_first;  // prev 移到翻转后的尾节点
     }
-    
+
     return dummy.next;
 }
 ```
@@ -164,7 +165,8 @@ __global__ void prefix_sum_baseline(const float* input, float* output, int n) {
     }
 }
 
-// 优化：双调排序 / Blelloch Scan
+// 优化：Blelloch Scan（注意：这是 exclusive prefix sum，不包含当前元素）
+// 如需 inclusive scan，最后将结果右移一位并在末尾补上总和
 __global__ void prefix_sum_blelloch(float* data, int n) {
     extern __shared__ float temp[];
     int tid = threadIdx.x;
