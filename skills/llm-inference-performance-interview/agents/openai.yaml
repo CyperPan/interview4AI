@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLM Inference Performance Interview"
+  short_description: "Coach LLM inference and HPC interviews"
+  default_prompt: "Use $llm-inference-performance-interview to answer an LLM inference, quantization, or HPC interview question with bottlenecks, tradeoffs, and quick calculations."
