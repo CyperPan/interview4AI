@@ -14,6 +14,7 @@
 | [MemoryOptimization.md](./MemoryOptimization.md) | 显存优化：ZeRO 详解、激活检查点、混合精度、框架对比 |
 | [InferenceOptimization.md](./InferenceOptimization.md) | 推理优化：Continuous Batching、PagedAttention、PD 分离、投机解码、量化 |
 | [InferenceInterviewReview.md](./InferenceInterviewReview.md) | 推理面试审查：题目质量、标准答案补充、结构建议 |
+| [LLMMathDerivations.md](./LLMMathDerivations.md) | LLM 数学推导：Embedding、RoPE、Attention、FFN、Norm、Adam、MoE、FLOPs |
 | [MultimodalTraining.md](./MultimodalTraining.md) | 多模态训练：挑战、视频模型优化、Omni 模型难点 |
 | [RLTraining.md](./RLTraining.md) | SFT/RL 训练：三阶段差异、RLHF 复杂度分析 |
 | [Troubleshooting.md](./Troubleshooting.md) | 排障实战：系统排查方法论、故障定位、工程价值观 |
@@ -25,6 +26,8 @@
 | [CodingProblems.md](./CodingProblems.md) | 手撕代码：Attention、CUDA、C++ 高并发、PagedAttention 分配器 |
 | [InterviewTips.md](./InterviewTips.md) | 面试实战话术：常见问答模板、回答技巧 |
 | [QuickInterviewAnswers.md](./QuickInterviewAnswers.md) | 30 秒口语答案：44 道高频题标准回答 |
+| [InferenceInterviewByPipeline.md](./InferenceInterviewByPipeline.md) | 按推理链路整理的面试题库：请求、Prefill、Attention、MoE、Decode、Sampling |
+| [TrainingInterviewByPipeline.md](./TrainingInterviewByPipeline.md) | 按训练链路整理的面试题库：数据、Forward、Backward、通信、Optimizer、RLHF |
 | [SeniorInterviewQuestions.md](./SeniorInterviewQuestions.md) | 资深面试官追问：高级话题、系统设计、故障排查 |
 | [NvidiaHPCInterview.md](./NvidiaHPCInterview.md) | NVIDIA/HPC 岗面经：C++、量化、CUDA、大模型理论 |
 | [CompanyInterviews.md](./CompanyInterviews.md) | 各公司面经汇总：美团、混元、网易、快手、AI Infra 人才库 |

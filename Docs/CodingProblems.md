@@ -1,5 +1,7 @@
 # 手撕代码
 
+> 文档定位：给出面试里常见的“能手写出来”的标准版本代码，并解释每段代码为什么这么写。这里优先追求 **正确、易讲、能在白板或在线 IDE 中复现**，而不是追求生产环境里的极致性能。
+
 ## 目录
 
 - [注意力机制实现](#注意力机制实现)
@@ -28,6 +30,13 @@ import torch
 import torch.nn as nn
 import math
 
+def make_causal_mask(seq_len, device):
+    # True 表示当前位置可见，False 表示需要屏蔽
+    return torch.tril(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+    ).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -45,14 +54,13 @@ class MultiHeadAttention(nn.Module):
     def scaled_dot_product_attention(self, Q, K, V, mask=None):
         """
         Q, K, V: (batch, n_heads, seq_len, d_k)
-        mask: (batch, 1, seq_len, seq_len) 或 None
+        mask: (batch, 1, seq_len, seq_len) 或 (1, 1, seq_len, seq_len)
         """
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
-        # scores: (batch, n_heads, seq_len, seq_len)
-        
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Q.size(-1))
+
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        
+            scores = scores.masked_fill(~mask, float("-inf"))
+
         attn = torch.softmax(scores, dim=-1)
         output = torch.matmul(attn, V)
         return output, attn
@@ -60,12 +68,15 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.size()
         
+        if mask is None:
+            mask = make_causal_mask(seq_len, x.device)
+
         # Linear projections
-        Q = self.W_q(x)  # (batch, seq_len, d_model)
+        Q = self.W_q(x)
         K = self.W_k(x)
         V = self.W_v(x)
-        
-        # Reshape for multi-head: (batch, n_heads, seq_len, d_k)
+
+        # (batch, seq_len, d_model) -> (batch, n_heads, seq_len, d_k)
         Q = Q.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
@@ -85,8 +96,9 @@ class MultiHeadAttention(nn.Module):
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model, n_heads, n_kv_heads):
         super().__init__()
+        assert d_model % n_heads == 0
         assert n_heads % n_kv_heads == 0
-        
+
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
@@ -109,28 +121,37 @@ class GroupedQueryAttention(nn.Module):
     
     def forward(self, x, mask=None):
         batch_size, seq_len, _ = x.size()
-        
+
+        if mask is None:
+            mask = make_causal_mask(seq_len, x.device)
+
         Q = self.W_q(x).view(batch_size, seq_len, self.n_heads, self.d_k).transpose(1, 2)
         K = self.W_k(x).view(batch_size, seq_len, self.n_kv_heads, self.d_k).transpose(1, 2)
         V = self.W_v(x).view(batch_size, seq_len, self.n_kv_heads, self.d_k).transpose(1, 2)
-        
-        # 复制 KV 头
+
         K = self.repeat_kv(K, self.n_rep)
         V = self.repeat_kv(V, self.n_rep)
-        
-        # 后续与 MHA 相同...
+
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, float('-inf'))
-        
+            scores = scores.masked_fill(~mask, float("-inf"))
+
         attn = torch.softmax(scores, dim=-1)
         output = torch.matmul(attn, V)
-        
+
         output = output.transpose(1, 2).contiguous().view(
             batch_size, seq_len, self.d_model
         )
         return self.W_o(output)
 ```
+
+**代码讲解：**
+
+1. 先把输入 `x` 线性投影成 `Q / K / V`，再 reshape 成多头格式 `(batch, heads, seq_len, head_dim)`。
+2. 注意力分数的计算是 `Q @ K^T / sqrt(dk)`，这里除以 `sqrt(dk)` 是为了避免点积值过大，导致 Softmax 饱和。
+3. 因果掩码必须在 **Softmax 之前** 应用，把未来位置写成 `-inf`，这样 Softmax 后对应概率才会变成 0。
+4. MHA 的每个 Q 头都有独立的 K/V 头；GQA 则让多个 Q 头共享一组 K/V 头，所以 `K / V` 投影出来后要重复到和 Q 头数一致。
+5. 面试里如果被追问，重点讲清楚“维度变化、Mask 位置、为什么 GQA 更省 KV Cache”这三点。
 
 ---
 
@@ -152,64 +173,81 @@ class GroupedQueryAttention(nn.Module):
 
 #define BLOCK_SIZE 256
 
-// 基础版：使用 Shared Memory
+// 基础版：每个 block 处理 2 * BLOCK_SIZE 个元素
 __global__ void reduce_sum_kernel(const float* input, float* output, int n) {
     __shared__ float shared[BLOCK_SIZE];
-    
+
     int tid = threadIdx.x;
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // 加载数据到 Shared Memory
-    shared[tid] = (gid < n) ? input[gid] : 0.0f;
+    int gid = blockIdx.x * blockDim.x * 2 + threadIdx.x;
+
+    float sum = 0.0f;
+    if (gid < n) {
+        sum += input[gid];
+    }
+    if (gid + blockDim.x < n) {
+        sum += input[gid + blockDim.x];
+    }
+
+    shared[tid] = sum;
     __syncthreads();
-    
-    // 树状归约
+
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             shared[tid] += shared[tid + stride];
         }
         __syncthreads();
     }
-    
-    // 写回结果
+
     if (tid == 0) {
         output[blockIdx.x] = shared[0];
     }
 }
 
-// 优化版：使用 Warp-level primitives
-__global__ void reduce_sum_warp_kernel(const float* input, float* output, int n) {
-    __shared__ float shared[32];  // 只需要 32 个，一个 warp
-    
-    int tid = threadIdx.x;
-    int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    float val = (gid < n) ? input[gid] : 0.0f;
-    
-    // Warp 内归约
-    for (int offset = 16; offset > 0; offset /= 2) {
+__inline__ __device__ float warp_reduce_sum(float val) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         val += __shfl_down_sync(0xffffffff, val, offset);
     }
-    
-    // 每个 warp 的第一个线程写结果
-    if (tid % 32 == 0) {
-        shared[tid / 32] = val;
+    return val;
+}
+
+// 优化版：先做 grid-stride 累加，再做 warp-level 归约
+__global__ void reduce_sum_warp_kernel(const float* input, float* output, int n) {
+    __shared__ float warp_sums[BLOCK_SIZE / 32];
+
+    int tid = threadIdx.x;
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = tid % warpSize;
+    int warp_id = tid / warpSize;
+
+    float val = 0.0f;
+    for (int i = gid; i < n; i += blockDim.x * gridDim.x) {
+        val += input[i];
+    }
+
+    val = warp_reduce_sum(val);
+
+    if (lane == 0) {
+        warp_sums[warp_id] = val;
     }
     __syncthreads();
-    
-    // 最后 32 个值的归约
-    if (tid < 32) {
-        val = shared[tid];
-        for (int offset = 16; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+
+    if (warp_id == 0) {
+        float block_sum = (lane < BLOCK_SIZE / 32) ? warp_sums[lane] : 0.0f;
+        block_sum = warp_reduce_sum(block_sum);
+        if (lane == 0) {
+            output[blockIdx.x] = block_sum;
         }
-    }
-    
-    if (tid == 0) {
-        output[blockIdx.x] = val;
     }
 }
 ```
+
+**代码讲解：**
+
+1. 基础版先把每个线程负责的数据累加到寄存器，再写进 shared memory，接着做标准树状规约。
+2. `__syncthreads()` 不能省，因为每一轮 stride 归约都依赖上一轮 shared memory 的结果。
+3. 优化版先让每个线程做 `grid-stride loop`，减少全局访存发射次数，再用 `__shfl_down_sync` 做 warp 内规约。
+4. 原理上是“两级规约”：先每个 warp 得到一个局部和，再让第 0 个 warp 把所有 warp 的结果规约成 block 结果。
+5. 面试里要主动指出：`warp-level primitive` 主要是为了减少 shared memory 读写和同步开销。
 
 ### 2. 手撕数值稳定的 Softmax
 
@@ -246,6 +284,13 @@ std::vector<float> softmax(const std::vector<float>& input) {
 }
 ```
 
+**代码讲解：**
+
+1. Softmax 最大的坑是数值溢出，所以第一步必须先找到最大值 `max_val`。
+2. 把每个元素改写成 `exp(x_i - max_val)`，不会改变最终结果，因为分子分母同时乘了同一个常数。
+3. 第一轮循环算指数和总和，第二轮循环再做归一化，逻辑最清楚，也适合白板手写。
+4. 如果面试官继续追问，可以补一句：LogSumExp 技巧和 FlashAttention 在线 Softmax 的数值稳定思路是一脉相承的。
+
 ### 3. 手撕 RMSNorm
 
 **题目：** 简历写了优化 RMSNorm，请用代码展示 RMSNorm 的计算公式。
@@ -255,29 +300,46 @@ std::vector<float> softmax(const std::vector<float>& input) {
 - CUDA 中计算 variance 时内存读取优化
 
 ```cpp
-// C++ 版本
+#include <vector>
+#include <cmath>
+#include <stdexcept>
+
 struct RMSNorm {
-    float eps;
-    std::vector<float> weight;
-    
-    std::vector<float> forward(const std::vector<float>& x) {
-        // 1. 计算 RMS (Root Mean Square)
+    explicit RMSNorm(size_t hidden_size, float eps_ = 1e-6f)
+        : eps(eps_), weight(hidden_size, 1.0f) {}
+
+    std::vector<float> forward(const std::vector<float>& x) const {
+        if (x.size() != weight.size()) {
+            throw std::invalid_argument("input size must match weight size");
+        }
+
         float sum_squares = 0.0f;
         for (float val : x) {
             sum_squares += val * val;
         }
-        float rms = std::sqrt(sum_squares / x.size() + eps);
-        
-        // 2. 归一化并缩放
+
+        const float mean_square = sum_squares / static_cast<float>(x.size());
+        const float inv_rms = 1.0f / std::sqrt(mean_square + eps);
+
         std::vector<float> output(x.size());
         for (size_t i = 0; i < x.size(); ++i) {
-            output[i] = (x[i] / rms) * weight[i];
+            output[i] = x[i] * inv_rms * weight[i];
         }
-        
+
         return output;
     }
+ 
+    float eps;
+    std::vector<float> weight;
 };
 ```
+
+**代码讲解：**
+
+1. RMSNorm 不减去均值，只计算均方根，所以它比 LayerNorm 少了一步“减 mean”。
+2. 先算 `mean(x^2)`，再算 `1 / sqrt(mean(x^2) + eps)`，最后乘上可学习参数 `weight`。
+3. 这里把 `inv_rms` 提前算出来，是为了避免循环里重复做除法。
+4. 面试里可以顺手补一句：RMSNorm 在实现上更简单，访存和计算都比 LayerNorm 更轻一些，所以常出现在 LLM 中。
 
 ---
 
@@ -297,55 +359,42 @@ struct RMSNorm {
 ```cpp
 #include <atomic>
 #include <vector>
-#include <optional>
 
 template<typename T>
 class LockFreeRingBuffer {
 public:
-    explicit LockFreeRingBuffer(size_t capacity) 
-        : capacity_(capacity), buffer_(capacity) {}
-    
-    // 生产者调用（单线程）
+    explicit LockFreeRingBuffer(size_t capacity)
+        : capacity_(capacity + 1), buffer_(capacity_) {}
+
     bool push(const T& item) {
         const size_t current_tail = tail_.load(std::memory_order_relaxed);
         const size_t next_tail = (current_tail + 1) % capacity_;
-        
-        // 检查队列是否满
+
         if (next_tail == head_.load(std::memory_order_acquire)) {
-            return false;  // 队列满
+            return false;
         }
-        
+
         buffer_[current_tail] = item;
-        
-        // Release：确保先写入数据，再更新 tail
-        // 防止编译器重排：保证 buffer_ 写入在 tail_ 更新之前可见
         tail_.store(next_tail, std::memory_order_release);
         return true;
     }
-    
-    // 消费者调用（单线程）
-    std::optional<T> pop() {
+
+    bool pop(T& item) {
         const size_t current_head = head_.load(std::memory_order_relaxed);
-        
-        // 检查队列是否空
+
         if (current_head == tail_.load(std::memory_order_acquire)) {
-            return std::nullopt;  // 队列空
+            return false;
         }
-        
-        T item = buffer_[current_head];
-        const size_t next_head = (current_head + 1) % capacity_;
-        
-        // Release：确保先读取数据，再更新 head
-        head_.store(next_head, std::memory_order_release);
-        return item;
+
+        item = buffer_[current_head];
+        head_.store((current_head + 1) % capacity_, std::memory_order_release);
+        return true;
     }
 
 private:
     size_t capacity_;
     std::vector<T> buffer_;
-    
-    // head_ 和 tail_ 用原子变量
-    // 用 alignas 避免 false sharing
+
     alignas(64) std::atomic<size_t> head_{0};
     alignas(64) std::atomic<size_t> tail_{0};
 };
@@ -355,13 +404,20 @@ private:
 
 ```cpp
 // Acquire：在这个操作之后的读写操作不能被重排到它之前
-// 消费者用：确保看到生产者写入的数据
-head_.load(std::memory_order_acquire);
+// 消费者读取 tail_：确保看到生产者已经写好的数据
+tail_.load(std::memory_order_acquire);
 
-// Release：在这个操作之前的读写操作不能被重排到它之后  
-// 生产者用：确保数据写入对消费者可见
+// Release：在这个操作之前的读写操作不能被重排到它之后
+// 生产者发布 tail_：确保 buffer_ 写入先于 tail_ 更新对外可见
 tail_.store(next_tail, std::memory_order_release);
 ```
+
+**代码讲解：**
+
+1. 这是单生产者单消费者队列，所以只有生产者写 `tail_`，只有消费者写 `head_`，实现上比 MPMC 简单得多。
+2. 这里故意把底层数组开成 `capacity + 1`，留出一个空槽位，用来区分“队列满”和“队列空”。
+3. `push` 里先写数据，再用 `release` 发布新的 `tail_`；`pop` 里先用 `acquire` 看到最新 `tail_`，再读数据。
+4. 如果面试官追问为什么不能全用 `memory_order_relaxed`，回答重点是：那样可能会出现“索引更新已可见，但数据本体还没对另一线程可见”的重排问题。
 
 ### 2. 手撕线程池（Thread Pool）
 
@@ -381,7 +437,7 @@ tail_.store(next_tail, std::memory_order_release);
 #include <queue>
 #include <functional>
 #include <vector>
-#include <atomic>
+#include <stdexcept>
 
 class ThreadPool {
 public:
@@ -390,46 +446,41 @@ public:
             workers_.emplace_back([this] {
                 while (true) {
                     std::function<void()> task;
-                    
+
                     {
                         std::unique_lock<std::mutex> lock(queue_mutex_);
-                        
-                        // 等待条件：队列非空 或 线程池停止
-                        // 必须用 while 防止虚假唤醒！
+
                         cv_.wait(lock, [this] {
                             return stop_ || !tasks_.empty();
                         });
-                        
-                        // 线程池停止且队列为空，退出
+
                         if (stop_ && tasks_.empty()) {
                             return;
                         }
-                        
+
                         task = std::move(tasks_.front());
                         tasks_.pop();
                     }
-                    
-                    // 执行任务（在锁外执行）
+
                     task();
                 }
             });
         }
     }
-    
+
     ~ThreadPool() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             stop_ = true;
         }
-        
-        cv_.notify_all();  // 唤醒所有线程
-        
+
+        cv_.notify_all();
+
         for (auto& worker : workers_) {
             worker.join();
         }
     }
-    
-    // 提交任务
+
     template<typename F>
     void submit(F&& f) {
         {
@@ -439,18 +490,25 @@ public:
             }
             tasks_.emplace(std::forward<F>(f));
         }
-        cv_.notify_one();  // 唤醒一个线程
+        cv_.notify_one();
     }
 
 private:
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
-    
+
     std::mutex queue_mutex_;
     std::condition_variable cv_;
-    std::atomic<bool> stop_;
+    bool stop_;
 };
 ```
+
+**代码讲解：**
+
+1. 整体就是标准生产者-消费者模型：主线程提交任务，worker 线程阻塞等待并消费任务。
+2. `cv_.wait(lock, predicate)` 比手写 `while` 更适合面试表达，因为它把“防虚假唤醒”的条件写得更清楚。
+3. 任务一定要在锁外执行，否则一个慢任务会把整个线程池的任务队列都堵住。
+4. 析构时先把 `stop_` 置为 `true`，再 `notify_all()` 唤醒所有 worker，让它们自行退出。
 
 ---
 
@@ -475,6 +533,7 @@ private:
 #include <unordered_map>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 class PagedAttentionAllocator {
 public:
@@ -558,8 +617,12 @@ public:
     }
     
     // 查询请求的逻辑到物理映射
-    const std::vector<int>& get_block_table(int request_id) {
-        return requests_[request_id].block_table;
+    const std::vector<int>& get_block_table(int request_id) const {
+        auto it = requests_.find(request_id);
+        if (it == requests_.end()) {
+            throw std::out_of_range("request_id not found");
+        }
+        return it->second.block_table;
     }
 
 private:
@@ -571,6 +634,13 @@ private:
     std::unordered_map<int, Request> requests_;
 };
 ```
+
+**代码讲解：**
+
+1. `free_blocks_` 维护所有空闲物理 block；`block_table` 记录某个请求的“逻辑块 -> 物理块”映射。
+2. 新请求进来时，从空闲链表里取 block；请求结束时，再把这些 block 放回空闲链表。
+3. 这和操作系统分页的思路一致：逻辑上连续，不代表物理上必须连续。
+4. 面试里被追问时，可以继续讲：真实系统还会有 `block 共享、引用计数、抢占和换出`，这里只是最小可讲清楚的版本。
 
 ---
 
