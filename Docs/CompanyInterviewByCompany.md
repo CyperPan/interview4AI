@@ -11,6 +11,7 @@
 | 公司 / 方向 | 面试侧重点 | 适合优先准备的能力 |
 | --- | --- | --- |
 | **NVIDIA / HPC** | C++ 基础、CUDA、量化、FlashAttention、PagedAttention、GPU 性能优化 | CUDA 编程、kernel 视角、硬件理解 |
+| **字节 AI Infra 实习** | Attention / MLA / MoE 手撕、访存量手算、DeepSeek-V3 结构、reduce 优化 | 推理链路理解、算量估算、代码基本功 |
 | **美团北斗 AI Infra** | Transformer 基础、GPU 基础、量化、PD 分离、PagedAttention、手撕代码 | 推理优化基础、工程表达、CUDA 手写 |
 | **混元 AI Infra** | FP4 / 低比特量化、Roofline、GPU 性能分析 | 低比特量化、性能瓶颈判断 |
 | **网易大模型应用开发** | 项目介绍、微调方式、推理加速、系统设计 | 项目表述、方案设计、产品落地 |
@@ -49,6 +50,44 @@
 ### 原始文档
 
 - [NvidiaHPCInterview.md](./NvidiaHPCInterview.md)
+
+---
+
+## 字节 AI Infra 实习
+
+### 这类岗位通常怎么问
+
+这类题会明显比“基础概念面”更硬一些。面试官通常不是只问你会不会解释 `continuous batching` 或 `paged attention`，而是直接看你能不能把 `MHA / MLA / MoE / DeepSeek-V3` 写成伪代码、把参数量和访存量手算出来，再继续追问 `reduce` 和通信优化。
+
+### 高频题方向
+
+- `linear attention`、`MHA`、`MLA`、`MoE` 手撕
+- Attention / MoE 的参数量与 decode 访存量手算
+- `DeepSeek-V3` 结构化伪代码、参数量估算、单次推理访存量估算
+- `reduce` kernel 优化与 collective reduction 思路
+- 基础算法题：堆排序
+
+### 代表题目
+
+- 手撕一个标准 `MHA`，并解释 mask、KV Cache 和维度变化
+- `MLA` 为什么能比普通 `MHA` 更省长上下文成本？
+- `MoE` 为什么常说“算力省了，但通信炸了”？
+- 如何手算某个 Attention 结构在 decode 时的主要访存量？
+- `DeepSeek-V3` 如果不背官网参数表，怎么按模块估算总参数和激活参数？
+- `reduce` 怎么从 shared memory 版继续优化到 warp-level？
+
+### 准备建议
+
+- 这类面试最忌讳只背概念。一定要能把结构写出来，再把复杂度和访存解释清楚。
+- 参数量题要区分 `总参数量`、`单 token 激活参数量`、`单步 decode 访存量`，这三者不是一回事。
+- 如果被问 `DeepSeek-V3`，不要只说“MoE + MLA + FP8”，而要继续讲 `为什么省 KV`、`为什么通信更复杂`、`推理时主要读什么`。
+
+### 原始文档
+
+- [CompanyInterviews.md](./CompanyInterviews.md#字节-ai-infra-实习二面)
+- [CodingProblems.md](./CodingProblems.md)
+- [LLMMathDerivations.md](./LLMMathDerivations.md)
+- [InferenceInterviewByPipeline.md](./InferenceInterviewByPipeline.md)
 
 ---
 

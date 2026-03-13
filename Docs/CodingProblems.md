@@ -6,6 +6,7 @@
 
 - [注意力机制实现](#注意力机制实现)
 - [CUDA 基础](#cuda-基础)
+- [算法基础](#算法基础)
 - [C++ 高并发](#c-高并发)
 - [PagedAttention 内存分配器](#pagedattention-内存分配器)
 
@@ -153,6 +154,217 @@ class GroupedQueryAttention(nn.Module):
 4. MHA 的每个 Q 头都有独立的 K/V 头；GQA 则让多个 Q 头共享一组 K/V 头，所以 `K / V` 投影出来后要重复到和 Q 头数一致。
 5. 面试里如果被追问，重点讲清楚“维度变化、Mask 位置、为什么 GQA 更省 KV Cache”这三点。
 
+### 手撕 Causal Linear Attention
+
+**题目：** 不用 `n x n` 注意力分数矩阵，写一个因果 `linear attention` 的简化实现。
+
+**考察点：**
+
+- 会不会把 attention 改写成前缀累计形式
+- 知道 `linear attention` 不是精确 softmax attention，而是借助正值特征映射近似
+- 能说清为什么它更适合长序列
+
+**参考实现：**
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def phi(x):
+    # 需要非负特征映射，便于做前缀累计
+    return F.elu(x) + 1.0
+
+
+class CausalLinearAttention(nn.Module):
+    def __init__(self, d_model, n_heads, eps=1e-6):
+        super().__init__()
+        assert d_model % n_heads == 0
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.eps = eps
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_k = nn.Linear(d_model, d_model, bias=False)
+        self.W_v = nn.Linear(d_model, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x):
+        batch, seq_len, _ = x.shape
+
+        q = self.W_q(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.W_k(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        q = phi(q)
+        k = phi(k)
+
+        kv_prefix = torch.zeros(
+            batch, self.n_heads, self.head_dim, self.head_dim, device=x.device, dtype=x.dtype
+        )
+        k_prefix = torch.zeros(
+            batch, self.n_heads, self.head_dim, device=x.device, dtype=x.dtype
+        )
+
+        outputs = []
+        for t in range(seq_len):
+            k_t = k[:, :, t, :]
+            v_t = v[:, :, t, :]
+            q_t = q[:, :, t, :]
+
+            kv_prefix = kv_prefix + k_t.unsqueeze(-1) * v_t.unsqueeze(-2)
+            k_prefix = k_prefix + k_t
+
+            numerator = torch.einsum("bhd,bhdm->bhm", q_t, kv_prefix)
+            denominator = torch.einsum("bhd,bhd->bh", q_t, k_prefix).unsqueeze(-1) + self.eps
+            outputs.append(numerator / denominator)
+
+        out = torch.stack(outputs, dim=2)
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
+        return self.W_o(out)
+```
+
+**代码讲解：**
+
+1. 核心不是去显式构造 `QK^T`，而是维护两个前缀量：`sum(phi(k_t) v_t^T)` 和 `sum(phi(k_t))`。
+2. 每到一个位置 `t`，只把当前 token 的 `k_t / v_t` 累加进去，就能得到因果 attention 的结果。
+3. 这段实现最适合面试表达，因为它直接体现了“为什么不需要 `n x n` 分数矩阵”。
+4. 它的优势主要在长序列复杂度和缓存压力上，但要主动说明：这不是精确 softmax attention 的等价实现，而是近似或变体。
+
+### 手撕 MLA（简化版）
+
+**题目：** 写一个面试可讲清楚的 `MLA` 简化实现，重点体现“压缩缓存，再恢复参与注意力”。
+
+**考察点：**
+
+- 是否理解 `MLA` 的核心不是换公式，而是降低 KV 侧缓存和带宽
+- 能否写出 latent 压缩与恢复路径
+- 能否讲清它和 `MHA / GQA` 的关系
+
+**参考实现：**
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+
+class SimpleMLA(nn.Module):
+    def __init__(self, d_model, n_heads, d_latent):
+        super().__init__()
+        assert d_model % n_heads == 0
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.d_latent = d_latent
+
+        self.W_q = nn.Linear(d_model, d_model, bias=False)
+        self.W_down = nn.Linear(d_model, d_latent, bias=False)
+        self.W_k_up = nn.Linear(d_latent, d_model, bias=False)
+        self.W_v_up = nn.Linear(d_latent, d_model, bias=False)
+        self.W_o = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x, mask=None):
+        batch, seq_len, _ = x.shape
+
+        q = self.W_q(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        latent_cache = self.W_down(x)  # 真实系统通常缓存更紧凑的 latent 表示
+        k = self.W_k_up(latent_cache).view(
+            batch, seq_len, self.n_heads, self.head_dim
+        ).transpose(1, 2)
+        v = self.W_v_up(latent_cache).view(
+            batch, seq_len, self.n_heads, self.head_dim
+        ).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(~mask, float("-inf"))
+
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
+        return self.W_o(out), latent_cache
+```
+
+**代码讲解：**
+
+1. 这里故意把 `MLA` 写成“`latent_cache = down(x)`，再从 latent 恢复出参与 attention 的表示”，这样最符合面试里的讲法。
+2. 真实系统会比这个版本更复杂，例如会把位置编码和无位置部分分开处理，也不一定按这里的形式直接恢复完整 `K/V`。
+3. 但面试里更重要的是把思想讲对：**缓存更小的 latent，而不是缓存完整多头 K/V。**
+4. 如果继续追问，最好顺手比较 `MHA -> GQA -> MLA` 这条压缩路径到底在省什么。
+
+### 手撕 MoE Router + Expert（简化版）
+
+**题目：** 用 PyTorch 写一个面试可讲清楚的 `MoE` 简化实现。
+
+**考察点：**
+
+- `router -> top-k -> dispatch -> combine`
+- token 只走少量 expert，而不是全激活
+- 能否主动指出这份代码是“表达结构正确”，不是高性能实现
+
+**参考实现：**
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Expert(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SimpleMoE(nn.Module):
+    def __init__(self, d_model, d_ff, n_experts, top_k=2):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [Expert(d_model, d_ff) for _ in range(n_experts)]
+        )
+
+    def forward(self, x):
+        router_logits = self.router(x)
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_probs, topk_idx = torch.topk(router_probs, k=self.top_k, dim=-1)
+
+        output = torch.zeros_like(x)
+        for expert_id, expert in enumerate(self.experts):
+            selected = (topk_idx == expert_id)
+            if not selected.any():
+                continue
+
+            weights = torch.where(
+                selected, topk_probs, torch.zeros_like(topk_probs)
+            ).sum(dim=-1, keepdim=True)
+            output = output + expert(x) * weights
+
+        return output, topk_idx, topk_probs
+```
+
+**代码讲解：**
+
+1. 这份实现先算 router 概率，再用 `topk` 找每个 token 该去哪些 expert。
+2. 为了面试时容易讲，这里没有真的把 token 重排到不同 expert buffer，而是用最直接的写法表达“只有被选中的 expert 对输出有贡献”。
+3. 如果面试官继续追问性能，你就顺着讲真实系统会做 token dispatch、专家并行、AllToAll 和负载均衡。
+4. 这题最容易失分的地方，是把 `MoE` 写成“所有 expert 都算一遍再加权”，那样结构上就不对了。
+
 ---
 
 ## CUDA 基础
@@ -249,6 +461,14 @@ __global__ void reduce_sum_warp_kernel(const float* input, float* output, int n)
 4. 原理上是“两级规约”：先每个 warp 得到一个局部和，再让第 0 个 warp 把所有 warp 的结果规约成 block 结果。
 5. 面试里要主动指出：`warp-level primitive` 主要是为了减少 shared memory 读写和同步开销。
 
+**如果面试官继续追问 reduce 怎么优化，可以按这个顺序继续答：**
+
+1. 先做 `grid-stride loop`，让每个线程多吃一点数据，减少调度开销。
+2. 再做 shared memory 树状规约，减少全局内存往返。
+3. 最后把 block 内最后一段换成 `warp shuffle`，减少同步和 shared memory 访问。
+4. 如果问题继续延伸到多卡，就从单机 `reduce` 过渡到 `reduce-scatter + all-gather` 或 ring `all-reduce`。
+5. 不管是单机还是多卡，优化主线都一样：减少不必要的数据搬运，尽量和计算 overlap。
+
 ### 2. 手撕数值稳定的 Softmax
 
 **题目：** 用 C++ 写一个 Softmax 函数。
@@ -340,6 +560,72 @@ struct RMSNorm {
 2. 先算 `mean(x^2)`，再算 `1 / sqrt(mean(x^2) + eps)`，最后乘上可学习参数 `weight`。
 3. 这里把 `inv_rms` 提前算出来，是为了避免循环里重复做除法。
 4. 面试里可以顺手补一句：RMSNorm 在实现上更简单，访存和计算都比 LayerNorm 更轻一些，所以常出现在 LLM 中。
+
+---
+
+## 算法基础
+
+### 手撕堆排序（Heap Sort）
+
+**题目：** 用 C++ 原地实现堆排序。
+
+**考察点：**
+
+- `heapify` 是否写稳
+- 建堆过程是不是从最后一个非叶子节点开始
+- 能否讲清时间复杂度和空间复杂度
+
+**参考实现：**
+
+```cpp
+#include <vector>
+#include <algorithm>
+
+void heapify(std::vector<int>& nums, int heap_size, int root) {
+    while (true) {
+        int largest = root;
+        int left = 2 * root + 1;
+        int right = 2 * root + 2;
+
+        if (left < heap_size && nums[left] > nums[largest]) {
+            largest = left;
+        }
+        if (right < heap_size && nums[right] > nums[largest]) {
+            largest = right;
+        }
+
+        if (largest == root) {
+            break;
+        }
+
+        std::swap(nums[root], nums[largest]);
+        root = largest;
+    }
+}
+
+void heap_sort(std::vector<int>& nums) {
+    int n = static_cast<int>(nums.size());
+    if (n <= 1) {
+        return;
+    }
+
+    for (int i = n / 2 - 1; i >= 0; --i) {
+        heapify(nums, n, i);
+    }
+
+    for (int end = n - 1; end > 0; --end) {
+        std::swap(nums[0], nums[end]);
+        heapify(nums, end, 0);
+    }
+}
+```
+
+**代码讲解：**
+
+1. 先建大顶堆，所以要从最后一个非叶子节点 `n / 2 - 1` 开始往前做 `heapify`。
+2. 每次把堆顶最大值交换到数组末尾，再对剩余区间重新 `heapify`。
+3. 总时间复杂度是 `O(n log n)`，额外空间复杂度是 `O(1)`。
+4. 面试里最好主动补一句：堆排序稳定性不好，但它的优点是原地排序，不需要额外线性空间。
 
 ---
 

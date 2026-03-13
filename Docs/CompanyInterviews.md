@@ -1,4 +1,4 @@
-# 各公司面经汇总（美团、混元、网易、快手等）
+# 各公司面经汇总（字节、美团、混元、网易、快手等）
 
 > 来源：牛客网多岗位汇总
 
@@ -7,6 +7,7 @@
 ## 目录
 
 - [美团北斗 AI Infra](#美团北斗-ai-infra)
+- [字节 AI Infra 实习二面](#字节-ai-infra-实习二面)
 - [混元 AI Infra](#混元-ai-infra)
 - [网易大模型应用开发](#网易大模型应用开发)
 - [快手 AI 应用开发](#快手-ai-应用开发)
@@ -263,6 +264,105 @@ __global__ void gemm_optimized(const float* A, const float* B, float* C,
     }
 }
 ```
+
+---
+
+## 字节 AI Infra 实习二面
+
+### 这一轮题目的特点
+
+这组题明显不是普通的“概念快答”，而是直接考你能不能把推理结构、稀疏架构、访存估算和通信优化写出来、算出来、讲明白。
+
+### Attention / MoE / 模型结构手撕
+
+#### 1. 手撕 `linear attention`
+
+**考察重点：**
+
+- 会不会把 `softmax(QK^T)V` 改写成可前缀累计的形式
+- 知道它不是“白送更快”，而是用近似或特征映射换复杂度
+- 能说清它和标准 attention 在长序列下的复杂度与适用场景差异
+
+#### 2. 手撕 `MHA`
+
+**考察重点：**
+
+- `Q / K / V` 投影和多头 reshape
+- causal mask 的位置
+- 为什么 decode 阶段更关心 `KV Cache` 而不是单纯 FLOPs
+
+#### 3. 手撕 `MLA`
+
+**考察重点：**
+
+- 知道它不是普通 `MHA` 改名，而是通过 latent 压缩来降低 KV 侧缓存和带宽
+- 伪代码里要体现 “先压缩缓存，再恢复 K/V 或等价表示参与注意力”
+- 能和 `GQA / MQA` 做对比，而不是孤立解释
+
+#### 4. 手撕 `MoE`
+
+**考察重点：**
+
+- `router -> top-k -> dispatch -> expert -> combine` 整条链路
+- 区分总参数量和单 token 激活参数量
+- 能解释为什么 MoE 经常是“计算省了，但通信更难”
+
+#### 5. 手撕 `DeepSeek-V3` 结构化伪代码
+
+**考察重点：**
+
+- 主干要写出 `Attention / MLA + MoE + 残差 + Norm`
+- 解释哪些部分决定长上下文成本，哪些部分决定专家通信成本
+- 面试里比起背官网表格，更重要的是把模块关系讲对
+
+### 参数量与访存量手算
+
+#### 6. 手算上面结构的参数量和 decode 访存量
+
+**考察重点：**
+
+- `MHA / MLA / MoE / linear attention` 不只是会写，还要会估算
+- 区分 `prefill` 的大矩阵计算和 `decode` 的权重 / KV 读取
+- 说清 `参数量大` 不等于 `单步推理一定慢`
+
+#### 7. 手算 `DeepSeek-V3` 每次推理的主要访存开销
+
+**考察重点：**
+
+- dense backbone 的权重读取
+- `MLA` 对 KV 侧开销的压缩
+- `MoE` 的激活 expert 权重读取与跨卡分发
+
+### 算法与通信手撕
+
+#### 8. 算法题：堆排序
+
+**考察重点：**
+
+- `heapify` 和建堆 / 取顶过程是否写得稳
+- 时间复杂度 `O(n log n)` 和原地排序特性
+
+#### 9. 手撕 `reduce` 并继续讲优化
+
+**考察重点：**
+
+- shared memory 规约
+- warp shuffle / 两级规约
+- global memory coalescing、bank conflict、同步开销
+
+#### 10. 继续追问 collective reduction 优化
+
+**考察重点：**
+
+- `all-reduce / reduce-scatter` 的拆分方式
+- bucket、overlap、拓扑感知
+- 通信原语为什么会成为训练或 MoE 的瓶颈
+
+### 推荐跳转
+
+- 手撕实现：见 [CodingProblems.md](./CodingProblems.md)
+- 参数量 / 访存量手算：见 [LLMMathDerivations.md](./LLMMathDerivations.md)
+- 按推理链路整理：见 [InferenceInterviewByPipeline.md](./InferenceInterviewByPipeline.md)
 
 ---
 

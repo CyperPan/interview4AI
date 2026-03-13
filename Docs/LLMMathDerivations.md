@@ -36,6 +36,7 @@
 - [11. Adam 与 AdamW](#11-adam-与-adamw)
 - [12. MoE Router 与 Top-k Gating](#12-moe-router-与-top-k-gating)
 - [13. 参数量、FLOPs 与 KV Cache 估算](#13-参数量flops-与-kv-cache-估算)
+- [14. 访存量、激活参数量与 DeepSeek 类结构手算](#14-访存量激活参数量与-deepseek-类结构手算)
 
 ---
 
@@ -1063,6 +1064,232 @@ bytes_used = estimate_kv_cache_bytes(
 )
 
 print(bytes_used / (1024 ** 3), "GB")
+```
+
+---
+
+## 14. 访存量、激活参数量与 DeepSeek 类结构手算
+
+### 公式
+
+#### 标准 MHA / GQA 的 decode 侧 KV 读取
+
+对单个生成步、单个样本、单层来说，历史 KV 的读取量可近似写成：
+
+`KV_read_bytes_per_step_per_layer ≈ seq_len * 2 * num_kv_heads * head_dim * bytes_per_elem`
+
+把层数和 batch 带上：
+
+`KV_read_bytes_per_step ≈ batch * num_layers * seq_len * 2 * num_kv_heads * head_dim * bytes_per_elem`
+
+#### MLA 的缓存量
+
+如果系统缓存的是更紧凑的 latent 表示，而不是完整 K/V，那么单层单 token 的缓存量更接近：
+
+`MLA_cache_bytes_per_token_per_layer ≈ d_latent * bytes_per_elem`
+
+相比标准 KV：
+
+`MHA_cache_bytes_per_token_per_layer ≈ 2 * num_kv_heads * head_dim * bytes_per_elem`
+
+#### Linear Attention 的状态量
+
+若使用特征映射后的线性 attention，并维护前缀状态：
+
+`S_t = Σ_{i<=t} phi(k_i) v_i^T`
+
+`z_t = Σ_{i<=t} phi(k_i)`
+
+则每层缓存状态大小近似为：
+
+`Linear_state_bytes_per_layer ≈ num_heads * (d_phi * d_v + d_phi) * bytes_per_elem`
+
+它随序列长度增长得更慢，甚至可以做到对 `seq_len` 不敏感。
+
+#### MoE 的总参数量与激活参数量
+
+若一个 MoE 层有 `N` 个 expert，每个 expert 参数量为 `P_expert`，共享部分参数量为 `P_shared`，router 参数量为 `P_router`，则：
+
+`P_total = P_shared + P_router + N * P_expert`
+
+若每个 token 只激活 `k` 个 expert，则单 token 激活参数量近似：
+
+`P_active = P_shared + P_router + k * P_expert`
+
+#### DeepSeek 类 `MLA + MoE` 结构的单步 decode 读取
+
+把它写成最通用的面试模板：
+
+`Bytes_decode_step ≈ Bytes_dense_weight + Bytes_active_expert_weight + Bytes_cache_read + Bytes_comm`
+
+其中：
+
+- `Bytes_dense_weight`：主干 dense 部分权重读取
+- `Bytes_active_expert_weight`：本步被激活 expert 的权重读取
+- `Bytes_cache_read`：历史 attention 状态读取，`MHA / GQA / MLA / linear attention` 形式不同
+- `Bytes_comm`：多卡 MoE token 分发或聚合通信
+
+### 在 LLM 中的作用
+
+- 帮你区分“模型总参数很大”和“单步真正读了多少”不是一回事
+- 帮你解释为什么 `MoE` 看起来参数很大，但单 token 激活的只是其中一小部分
+- 帮你解释为什么 `MLA / GQA / linear attention` 的价值主要体现在缓存和带宽，而不是只看理论 FLOPs
+- 帮你在面试里用统一框架手算 `DeepSeek-V3` 这类结构，而不是死记一个公开数字
+
+### 详细推导
+
+很多人手算时最容易把三件事混在一起：
+
+1. **总参数量**
+2. **单 token 激活参数量**
+3. **单步 decode 访存量**
+
+这三者必须先拆开。
+
+先看标准 `MHA`。decode 第 `t` 步时，新 token 需要和前 `t` 个历史 token 的 `K/V` 做注意力，所以单层至少要把历史 `K` 和 `V` 各读一遍。于是有：
+
+`KV_read_bytes_per_step_per_layer ≈ t * 2 * num_kv_heads * head_dim * bytes_per_elem`
+
+当 `t` 很大时，这个量会线性增长。也就是说，长上下文里 decode 慢，很多时候不是算不动，而是历史 `KV` 越读越多。
+
+`GQA / MQA` 为什么有效？因为它们直接把 `num_kv_heads` 变小了。公式里别的量不变，只有 `num_kv_heads` 缩小，所以缓存和读取量会按比例下降。
+
+`MLA` 再进一步。它的关键不是“把 attention 换成另一个公式”，而是让缓存更接近一个低维 latent 表示。于是每个 token、每层缓存的不是完整 `K/V`，而是更小的 latent。手算时最重要的是比较：
+
+`2 * num_kv_heads * head_dim`
+
+和
+
+`d_latent`
+
+谁更大。只要 `d_latent` 显著更小，长上下文缓存和读取压力就会明显下降。
+
+`Linear attention` 又是另一个方向。它不再显式保存所有历史 token 的 `K/V`，而是把历史压缩成前缀状态 `S_t` 和 `z_t`。所以它的状态量更像：
+
+`num_heads * (d_phi * d_v + d_phi)`
+
+而不再是：
+
+`seq_len * 2 * num_kv_heads * head_dim`
+
+这也是为什么 linear attention 在超长序列题里经常被拿来和标准 attention 对比。
+
+再看 `MoE`。很多人一看到 expert 数量大，就直接说“推理一定更慢”，这是不对的。因为总参数量：
+
+`P_total = P_shared + P_router + N * P_expert`
+
+但单 token 激活的通常只有：
+
+`P_active = P_shared + P_router + k * P_expert`
+
+其中 `k << N`。  
+所以 `MoE` 的问题不只是“算了多少”，而是“这些被选中的 expert 在哪里、要不要跨卡取、通信是不是成为瓶颈”。
+
+把这些合起来，`DeepSeek-V3` 这类 `MLA + MoE` 结构在面试里最稳的手算法就是：
+
+1. 先估主干 dense 部分参数和每步权重读取
+2. 再估 `MLA` 相比标准 `MHA/GQA` 少掉多少缓存和读取
+3. 再估 `MoE` 的总 expert 参数量，以及每步只激活 `k` 个 expert 时的读取量
+4. 最后补一个系统项：如果 expert 分布在多卡，还要加上 `AllToAll` 或类似 token 分发通信
+
+这样你的答案就会从“背模型名词”变成“能把结构翻译成带宽、显存和通信”。
+
+### PyTorch 代码
+
+```python
+def estimate_mha_kv_read_bytes(
+    batch,
+    seq_len,
+    num_layers,
+    num_kv_heads,
+    head_dim,
+    bytes_per_elem=2,
+):
+    return (
+        batch
+        * num_layers
+        * seq_len
+        * 2
+        * num_kv_heads
+        * head_dim
+        * bytes_per_elem
+    )
+
+
+def estimate_mla_cache_bytes(
+    batch,
+    seq_len,
+    num_layers,
+    d_latent,
+    bytes_per_elem=2,
+):
+    return batch * seq_len * num_layers * d_latent * bytes_per_elem
+
+
+def estimate_linear_attention_state_bytes(
+    batch,
+    num_layers,
+    num_heads,
+    d_phi,
+    d_v,
+    bytes_per_elem=2,
+):
+    return (
+        batch
+        * num_layers
+        * num_heads
+        * (d_phi * d_v + d_phi)
+        * bytes_per_elem
+    )
+
+
+def estimate_moe_params(p_shared, p_router, p_expert, n_experts, top_k):
+    p_total = p_shared + p_router + n_experts * p_expert
+    p_active = p_shared + p_router + top_k * p_expert
+    return p_total, p_active
+
+
+def estimate_deepseek_like_decode_bytes(
+    dense_weight_bytes,
+    active_expert_weight_bytes,
+    cache_read_bytes,
+    comm_bytes=0,
+):
+    return (
+        dense_weight_bytes
+        + active_expert_weight_bytes
+        + cache_read_bytes
+        + comm_bytes
+    )
+
+
+mha_kv = estimate_mha_kv_read_bytes(
+    batch=1,
+    seq_len=8192,
+    num_layers=32,
+    num_kv_heads=8,
+    head_dim=128,
+)
+
+mla_cache = estimate_mla_cache_bytes(
+    batch=1,
+    seq_len=8192,
+    num_layers=32,
+    d_latent=512,
+)
+
+moe_total, moe_active = estimate_moe_params(
+    p_shared=400_000_000,
+    p_router=10_000_000,
+    p_expert=120_000_000,
+    n_experts=64,
+    top_k=2,
+)
+
+print("MHA decode KV read (GB):", mha_kv / (1024 ** 3))
+print("MLA cache (GB):", mla_cache / (1024 ** 3))
+print("MoE total params:", moe_total)
+print("MoE active params per token:", moe_active)
 ```
 
 ---
