@@ -438,6 +438,7 @@
 - [NvidiaHPCInterview.md](./Docs/NvidiaHPCInterview.md)
 - [CompanyInterviews.md](./Docs/CompanyInterviews.md)
 - [CompanyInterviewByCompany.md](./Docs/CompanyInterviewByCompany.md)
+- [BaiduAIInfraInterview.md](./Docs/BaiduAIInfraInterview.md) — 百度 Paddle HPC / 美团 / 快手等 AI Infra 面经（牛客网，53题）
 
 ---
 
