@@ -16,8 +16,9 @@
 | [InferenceInterviewReview.md](./InferenceInterviewReview.md) | 推理面试审查：题目质量、标准答案补充、结构建议 |
 | [LLMMathDerivations.md](./LLMMathDerivations.md) | LLM 数学推导：Embedding、RoPE、Attention、FFN、Norm、Adam、MoE、FLOPs |
 | [MultimodalTraining.md](./MultimodalTraining.md) | 多模态训练：挑战、视频模型优化、Omni 模型难点 |
-| [RLTraining.md](./RLTraining.md) | SFT/RL 训练：三阶段差异、RLHF 复杂度分析 |
-| [Troubleshooting.md](./Troubleshooting.md) | 排障实战：系统排查方法论、故障定位、工程价值观 |
+| [RLTraining.md](./RLTraining.md) | SFT/RL 训练：三阶段差异、RLHF 复杂度分析、DPO/PPO/GRPO/DAPO 对比 |
+| [Troubleshooting.md](./Troubleshooting.md) | 排障实战：系统排查方法论、故障定位、工程价值观、Loss 突刺排查 |
+| [MiscInterviewTopics.md](./MiscInterviewTopics.md) | 综合面试题：Agent、解码策略、Scaling Law、幻觉、超长上下文、R1 等 |
 
 ### 面试专项
 

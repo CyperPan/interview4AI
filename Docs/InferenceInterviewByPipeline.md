@@ -31,6 +31,8 @@
 - [模块 7：Speculative Decoding（可选）](#模块-7speculative-decoding可选)
 - [模块 8：Sampling 与 Output](#模块-8sampling-与-output)
 - [模块 9：跨阶段优化与指标](#模块-9跨阶段优化与指标)
+- [模块 10：推理核心技术补充面试题](#模块-10推理核心技术补充面试题)
+- [模块 11：模型架构面试题](#模块-11模型架构面试题)
 
 ---
 
@@ -679,6 +681,311 @@ DeepSeek MTP:
 
 ---
 
+## 模块 10：推理核心技术补充面试题
+
+### KV Cache 原理
+
+**答：**
+
+自回归解码中，每生成一个新 token 都需要与所有历史 token 做 Attention。
+
+```
+无 KV Cache（每步重算所有 K/V）：
+Step 1: 计算 Q1, K1, V1 → Attn(Q1, [K1], [V1])
+Step 2: 计算 Q2, K2, V2, 重算 K1, V1 → Attn(Q2, [K1,K2], [V1,V2])
+Step 3: 计算 Q3, K3, V3, 重算 K1,K2, V1,V2 → ...
+总计算: O(n²) 的 KV 投影
+
+有 KV Cache（缓存历史 K/V）：
+Step 1: 计算 K1, V1 → 缓存 → Attn
+Step 2: 只算 K2, V2 → 追加缓存 → Attn(Q2, [K1,K2], [V1,V2])
+Step 3: 只算 K3, V3 → 追加缓存 → Attn(Q3, [K1,K2,K3], ...)
+总计算: O(n) 的 KV 投影
+```
+
+**KV Cache 大小公式：**
+```
+KV Cache (bytes) = 2 × num_layers × num_kv_heads × head_dim × seq_len × batch_size × bytes_per_param
+
+示例（7B LLaMA, FP16, batch=1, seq=4096）：
+= 2 × 32 × 32 × 128 × 4096 × 1 × 2 ≈ 2 GB
+```
+
+**核心 Trade-off：用显存换计算。** 显存占用随序列长度线性增长，但避免了 O(n²) 的重复计算。
+
+### R1 的 MLA 是如何实现 KV-Cache 节约的
+
+**答：**
+
+**MLA（Multi-head Latent Attention）** 是 DeepSeek-V2/R1 的核心创新，通过低秩压缩 KV 来减少缓存。
+
+```
+标准 MHA 的 KV Cache（每 token 每层）：
+cache = [K, V] = 2 × n_heads × d_head
+       例：2 × 128 × 128 = 32768 维
+
+MLA 的 KV Cache（每 token 每层）：
+Step 1: 下投影（压缩）
+  c_t = W_DKV · h_t        ← h_t ∈ R^d → c_t ∈ R^{d_c}, d_c << n_h × d_h
+  只缓存 c_t（+ RoPE 分量 k_rope）
+
+Step 2: 上投影（计算时恢复）
+  K = W_UK · c_t            ← 从低维恢复 K
+  V = W_UV · c_t            ← 从低维恢复 V
+
+Cache = c_t + k_rope ≈ d_c + d_rope 维
+       例：512 + 64 = 576 维
+```
+
+**节省效果：**
+```
+MHA:  32768 维/token/层 (2 × 128 × 128)
+GQA:  2048 维/token/层  (2 × 8 × 128, 8 个 KV head)
+MLA:  576 维/token/层   (512 + 64)
+
+MLA vs MHA: 减少 ~98%
+MLA vs GQA: 减少 ~72%
+```
+
+**为什么要单独缓存 RoPE 分量：** RoPE 与位置相关，无法被低秩压缩吸收（因为旋转矩阵依赖绝对位置），所以需要单独存储位置编码相关的 key 分量。
+
+### 讲讲推理中的 KV Cache 和 Paged Attention
+
+**答：**
+
+**KV Cache 的问题：** 传统实现预分配连续内存，但实际序列长度不确定。
+
+```
+预分配方式（浪费严重）：
+请求1 [████░░░░░░░░░░░░] 实际 512，分配 2048 → 浪费 75%
+请求2 [████████████░░░░] 实际 1536，分配 2048 → 浪费 25%
+平均显存利用率只有 ~30-50%
+```
+
+**PagedAttention（vLLM）：** 借鉴操作系统虚拟内存分页机制。
+
+```
+KV Cache 分成固定大小的 Block（如 16 tokens/block）：
+
+逻辑视图（连续）：  [Block0][Block1][Block2][Block3]
+物理视图（不连续）：  [Block0][_][Block2][_][Block1][Block3]
+                              ↑ 其他请求     ↑ 其他请求
+
+Page Table 维护映射：
+请求1: 逻辑Block0 → 物理Block3, 逻辑Block1 → 物理Block7, ...
+请求2: 逻辑Block0 → 物理Block1, ...
+```
+
+**PagedAttention 的关键优势：**
+1. **近零浪费**：按需分配 Block，不预分配
+2. **Copy-on-Write**：Beam Search 中多个 beam 共享前缀 KV，分叉时才复制
+3. **动态增长**：序列变长时追加新 Block，不需要重新分配
+4. **吞吐提升 2-4x**：更高显存利用率 → 更多并发请求
+
+### 介绍下 Softmax、Safe-Softmax、Online-Softmax、Flash Attention
+
+**答：**
+
+**演化链路：** Softmax → Safe-Softmax → Online-Softmax → Flash Attention
+
+**1. Softmax：**
+```
+softmax(x_i) = exp(x_i) / Σ_j exp(x_j)
+问题：exp(x_i) 可能溢出（x_i > 88 时 FP32 就溢出）
+需要 3 次遍历：计算 exp → 求和 → 归一化
+```
+
+**2. Safe-Softmax：**
+```
+m = max(x)  ← 第 1 遍：找最大值
+softmax(x_i) = exp(x_i - m) / Σ_j exp(x_j - m)
+减去最大值防止溢出，数学等价
+需要 3 次遍历：找 max → 计算 exp 和 sum → 归一化
+```
+
+**3. Online-Softmax：**
+```
+在一次遍历中同时更新 max 和 sum：
+for each x_i:
+    if x_i > m:
+        sum = sum × exp(m - x_i) + 1  ← 修正历史 sum
+        m = x_i
+    else:
+        sum = sum + exp(x_i - m)
+减少为 2 次遍历：（1 遍更新 max+sum，1 遍归一化）
+```
+
+**4. Flash Attention：**
+```
+将 Online-Softmax 推广到分块 Attention 计算：
+- 将 Q/K/V 分成 tiles
+- 每个 tile 内用 Online-Softmax 计算部分 attention
+- tile 间通过在线更新修正 softmax 统计量
+- 最终结果数学精确（exact attention）
+
+核心：不需要 N×N attention 矩阵，只需 tile 大小的 SRAM 空间
+```
+
+### Flash Attention 加速原理，FA2 相比 FA1 改进
+
+**答：**
+
+**FA1 核心原理：**
+- **Tiling**：Q/K/V 分块加载到 SRAM（~20MB），避免 N×N 矩阵写入 HBM
+- **Online-Softmax**：分块计算中维护 running max 和 running sum
+- **重计算**：反向传播时从 Q/K/V 重算 attention（不存中间矩阵）
+- **IO 复杂度**：从 O(N²) HBM 访问降到 O(N²d/M)
+
+**FA2 改进（~2x speedup over FA1）：**
+
+| 改进点 | FA1 | FA2 |
+|--------|-----|-----|
+| **外层循环** | 遍历 K/V blocks | **遍历 Q blocks** → 每个 Q block 的结果在 SRAM 完成后一次写出 |
+| **非 matmul FLOPs** | rescaling 在每个 inner loop | **延迟到最后统一 rescaling** → 减少非矩阵乘操作 |
+| **并行维度** | batch × heads | batch × heads × **Q blocks** → 更多并行度 |
+| **Warp 间分工** | split K/V across warps | **split Q across warps** → 减少 warp 间共享内存通信 |
+| **最大 head_dim** | 128 | **256** |
+
+### FA3 相比 FA2 改进
+
+**答：**
+
+FA3 专为 **Hopper 架构（H100）** 设计，充分利用新硬件特性：
+
+| 改进点 | FA2 | FA3 |
+|--------|-----|-----|
+| **数据搬运** | Thread 手动 load | **TMA 异步搬运**（硬件自动） |
+| **执行模型** | 所有 warp 做相同工作 | **Warp Specialization**（生产者-消费者模式） |
+| **调度策略** | 单缓冲 | **Ping-pong 双缓冲调度** |
+| **低精度支持** | FP16/BF16 | 新增 **FP8** |
+| **FP8 精度保持** | - | **Incoherent Processing**（随机正交变换） |
+| **硬件指令** | HMMA | **WGMMA**（更高效的矩阵乘指令） |
+| **相对速度** | 1x | **1.5-2x** |
+
+**Warp Specialization 详解：**
+```
+FA2: 所有 warp → load data → compute → load data → compute（串行）
+
+FA3: Producer warps: → load tile_0 → load tile_1 → load tile_2 →
+     Consumer warps:           → compute_0 → compute_1 → compute_2 →
+     完全流水线化，load 和 compute 完全重叠
+```
+
+### TP=2 时，self-attention 层里的 QKV 矩阵怎么切分
+
+**答：**
+
+**Tensor Parallelism 对 Attention 的切分方式：按 head 切分。**
+
+```
+假设模型有 32 个 attention heads，TP=2：
+
+GPU 0: heads 0-15  (16 heads)
+GPU 1: heads 16-31 (16 heads)
+
+具体切分：
+W_Q ∈ R^{d × d}  → column-split → GPU0: W_Q[:, :d/2], GPU1: W_Q[:, d/2:]
+W_K ∈ R^{d × d}  → column-split → GPU0: W_K[:, :d/2], GPU1: W_K[:, d/2:]
+W_V ∈ R^{d × d}  → column-split → GPU0: W_V[:, :d/2], GPU1: W_V[:, d/2:]
+W_O ∈ R^{d × d}  → row-split    → GPU0: W_O[:d/2, :], GPU1: W_O[d/2:, :]
+```
+
+**计算流程：**
+```
+Step 1: 各 GPU 计算本地 heads 的 QKV（无通信）
+  GPU0: Q0 = X · W_Q0, K0 = X · W_K0, V0 = X · W_V0
+  GPU1: Q1 = X · W_Q1, K1 = X · W_K1, V1 = X · W_V1
+
+Step 2: 各 GPU 独立计算本地 attention（无通信）
+  GPU0: O0 = Attention(Q0, K0, V0) · W_O0
+  GPU1: O1 = Attention(Q1, K1, V1) · W_O1
+
+Step 3: AllReduce 聚合输出（需要通信）
+  Output = O0 + O1  ← AllReduce
+```
+
+**关键点：**
+- QKV 投影是 Column Parallel（按 head 切），无通信
+- Output 投影是 Row Parallel，需要 AllReduce
+- **每个 Attention 层只需 1 次 AllReduce 通信**
+
+---
+
+## 模块 11：模型架构面试题
+
+### Qwen 系列模型的结构和特点
+
+**答：**
+
+| 版本 | 参数量 | 架构特点 | 关键技术 |
+|------|--------|---------|---------|
+| **Qwen** | 7B/14B | Decoder-only | RoPE, SwiGLU, RMSNorm |
+| **Qwen1.5** | 0.5B~72B | 同上 + GQA | 扩展模型系列 |
+| **Qwen2** | 0.5B~72B | GQA + Sliding Window | 部分层用滑动窗口注意力 |
+| **Qwen2.5** | 0.5B~72B | 同 Qwen2 | 更多训练数据，更强代码/数学 |
+| **Qwen3** | Dense + MoE | 新增 MoE 版本 + Thinking Mode | 128 experts, Top-8, shared experts |
+
+**Qwen 系列共性特征：**
+- 位置编码：RoPE（+ YaRN 扩展长上下文）
+- 激活函数：SwiGLU
+- 归一化：RMSNorm（Pre-Norm）
+- 注意力：GQA（Qwen2+）
+- 词表：大词表（151K+），多语言友好
+
+### DeepSeek 系列模型的结构和特点
+
+**答：**
+
+| 版本 | 总参数/激活 | 核心创新 |
+|------|-----------|---------|
+| **V1** | 67B Dense | 标准 Decoder-only |
+| **V2** | 236B/21B | **MLA** + 细粒度 MoE（160 experts） |
+| **V3** | 671B/37B | 无辅助 loss 均衡 + **FP8 训练** + MTP |
+| **R1** | 基于 V3 | **GRPO RL 训练** + 长链推理 |
+
+**关键创新详解：**
+
+1. **MLA（Multi-head Latent Attention）**：KV 低秩压缩，缓存减少 93%+
+2. **细粒度 MoE**：256 个小 expert + 共享 expert
+3. **FP8 训练**：V3 全程 FP8 混合精度，训练效率翻倍
+4. **MTP（Multi-Token Prediction）**：训练时预测多个未来 token
+5. **GRPO（R1）**：无 Critic 的 RL，组内相对奖励
+
+### Qwen3 相比 Qwen2.5 有哪些改进
+
+**答：**
+
+| 维度 | Qwen2.5 | Qwen3 |
+|------|---------|-------|
+| **架构** | Dense only | Dense + **MoE 版本** |
+| **推理模式** | 标准生成 | 新增 **Thinking Mode**（显示推理过程） |
+| **MoE 配置** | 无 | 128 routed + shared experts, Top-8 |
+| **上下文** | 128K | 128K+（改进 YaRN） |
+| **多语言** | 强 | 更强（更多语种覆盖） |
+| **代码/数学** | 强 | 显著提升 |
+| **基础架构** | RoPE + SwiGLU + RMSNorm + GQA | 同上（保持稳定） |
+
+**Thinking Mode：** Qwen3 可以在生成最终回答前，先输出内部推理过程（类似 DeepSeek-R1 的 chain-of-thought），用户可选是否显示。
+
+### DeepSeek 在哪些方面做了改进使其训练成本显著降低
+
+**答：**
+
+DeepSeek-V3 训练成本仅约 **$5.5M**（vs 同等模型数百万美元），关键优化：
+
+| 优化点 | 节省来源 | 效果 |
+|--------|---------|------|
+| **MLA** | KV Cache 减少 → 支持更长上下文/更大 batch | 推理效率 ↑ |
+| **细粒度 MoE** | 671B 参数但只激活 37B | 计算量只有同等 Dense 的 ~5% |
+| **FP8 训练** | 2x 计算吞吐（vs BF16） | 训练时间减半 |
+| **无辅助 loss 均衡** | 更好的 expert 利用率 | 训练效率 ↑ |
+| **MTP（Multi-Token Prediction）** | 更丰富的训练信号 | 数据效率 ↑ |
+| **高效工程** | 通信优化、流水线设计 | 硬件利用率 ↑ |
+
+**关键洞察：** DeepSeek 证明了"架构创新 > 堆算力"。通过 MLA 节省显存、MoE 节省计算、FP8 提升吞吐，实现了用 2048 张 H800（而非万卡集群）训练顶级模型。
+
+---
+
 ## 推荐使用方式
 
 如果你要准备推理面试，可以按这个顺序读：
@@ -687,6 +994,7 @@ DeepSeek MTP:
 2. 再读 `模块 2 + 模块 7`，理解调度和高级加速
 3. 如果面试偏系统，补 `模块 5 + 模块 9`
 4. 如果面试偏产品或应用，重点看 `模块 8`
+5. 补充阅读 `模块 10` 的核心技术题和 `模块 11` 的模型架构题
 
 ---
 

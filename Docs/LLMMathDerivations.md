@@ -37,6 +37,7 @@
 - [12. MoE Router 与 Top-k Gating](#12-moe-router-与-top-k-gating)
 - [13. 参数量、FLOPs 与 KV Cache 估算](#13-参数量flops-与-kv-cache-估算)
 - [14. 访存量、激活参数量与 DeepSeek 类结构手算](#14-访存量激活参数量与-deepseek-类结构手算)
+- [15. Transformer 架构高频面试题](#15-transformer-架构高频面试题)
 
 ---
 
@@ -1294,19 +1295,468 @@ print("MoE active params per token:", moe_active)
 
 ---
 
+## 15. Transformer 架构高频面试题
+
+### Transformer 模型结构总览
+
+**答：**
+
+**三大架构变体：**
+
+| 架构 | 代表模型 | 注意力类型 | 主要任务 |
+|------|---------|-----------|---------|
+| **Encoder-only** | BERT, RoBERTa | 双向全注意力 | 文本分类、NER |
+| **Decoder-only** | GPT, LLaMA, Qwen | 因果单向注意力 | 文本生成、对话 |
+| **Encoder-Decoder** | T5, BART | 编码双向 + 解码因果 + 交叉注意力 | 翻译、摘要 |
+
+**现代 LLM（Decoder-only）的标准结构：**
+
+```
+Input Token IDs
+    ↓
+[Embedding Layer]  ← token embedding（通常 weight tying 共享 LM Head）
+    ↓
+┌─────────────────────────────────┐
+│ × N layers:                     │
+│   RMSNorm → MHA → + Residual   │  ← Pre-Norm + 残差
+│   RMSNorm → FFN → + Residual   │  ← Pre-Norm + 残差
+└─────────────────────────────────┘
+    ↓
+[RMSNorm]  ← 最终归一化
+    ↓
+[LM Head (Linear)]  ← 投影到词表大小，输出 logits
+    ↓
+Softmax → Token Probabilities
+```
+
+### 说一下 Decoder 的因果注意力，QKV 分别来自哪
+
+**答：**
+
+**因果注意力（Causal Attention）：** 每个 token 只能看到自己和之前的 token，不能看到未来的 token。
+
+```
+因果掩码示例（4 个 token）：
+      t1  t2  t3  t4
+t1  [ 1   0   0   0 ]  ← t1 只能看 t1
+t2  [ 1   1   0   0 ]  ← t2 能看 t1, t2
+t3  [ 1   1   1   0 ]  ← t3 能看 t1, t2, t3
+t4  [ 1   1   1   1 ]  ← t4 能看所有
+
+实现：在 softmax 前将未来位置设为 -inf
+scores = QK^T / √d_k
+scores = scores.masked_fill(mask == 0, -inf)
+attn = softmax(scores)
+```
+
+**QKV 的来源：**
+
+| 架构 | Q 来自 | K 来自 | V 来自 |
+|------|--------|--------|--------|
+| **Decoder self-attention** | 当前层输入 | 当前层输入 | 当前层输入 |
+| **Cross-attention (Enc-Dec)** | Decoder 层输入 | Encoder 输出 | Encoder 输出 |
+| **Decoder-only LLM** | 只有 self-attention，QKV 全来自同一输入 | | |
+
+### Transformer 介绍下 QKV 的作用
+
+**答：**
+
+**Q（Query）** = "我在找什么"
+**K（Key）** = "我有什么信息"
+**V（Value）** = "我的实际内容"
+
+```
+类比信息检索：
+Q = 搜索关键词
+K = 文档标题/索引
+V = 文档正文
+
+Attention(Q, K, V) = softmax(QK^T / √d_k) · V
+
+Step 1: QK^T → 计算每个 token 与其他 token 的相关性（注意力分数）
+Step 2: softmax → 归一化为概率分布
+Step 3: × V → 用概率加权聚合各 token 的信息
+```
+
+**为什么要分离 QKV 而不直接用 X？**
+- 分离后，Q/K/V 可以学到不同的线性变换
+- Q 学"查什么"，K 学"提供什么索引"，V 学"给出什么内容"
+- 这比 X·X^T 更灵活（否则只能计算输入之间的余弦相似度）
+
+### 推导多头注意力计算复杂度
+
+**答：**
+
+**单头注意力：**
+```
+Q, K, V ∈ R^{n × d_h}  （n=序列长度, d_h=head_dim）
+
+QK^T: (n × d_h) × (d_h × n) = O(n² d_h)     ← 注意力分数
+softmax: O(n²)                                  ← 逐行归一化
+× V:  (n × n) × (n × d_h) = O(n² d_h)          ← 加权聚合
+
+单头总计: O(n² d_h)
+```
+
+**多头注意力（h 个头，d_h = d/h）：**
+```
+h 个头并行: h × O(n² · d/h) = O(n² d)          ← 总注意力计算
+
+QKV 投影: 3 × (n × d) × (d × d) = O(3nd²)      ← 线性投影
+Output 投影: (n × d) × (d × d) = O(nd²)         ← 输出投影
+
+MHA 总复杂度: O(n²d + nd²)
+```
+
+**瓶颈分析：**
+- 当 n >> d（长序列）：O(n²d) 主导 → **attention 是瓶颈**
+- 当 d >> n（短序列大模型）：O(nd²) 主导 → **投影是瓶颈**
+- LLM 实际中：prefill 时 n 较大 → attention 瓶颈；decode 时 n=1 → 投影瓶颈
+
+### 为什么 Transformer 使用多头注意力
+
+**答：**
+
+1. **多子空间表示**：不同 head 可以关注不同类型的关系
+   ```
+   Head 1: 关注语法结构（主谓宾）
+   Head 2: 关注语义相似性
+   Head 3: 关注位置距离
+   Head 4: 关注共指关系
+   ```
+
+2. **训练更稳定**：多个 head 的 attention 分布更分散，不容易出现某些 token 被完全忽略
+
+3. **并行计算**：多个小矩阵乘法比一个大矩阵乘法更适合 GPU 并行
+
+4. **参数效率**：多头的参数量和单头相同（d² 总共），但表达能力更强
+
+5. **经验验证**：论文实验证明 h=8 显著优于 h=1（同参数量）
+
+**类比：** 多头注意力相当于"注意力的集成学习"——多个专家从不同角度看问题，最后综合判断。
+
+### 注意力机制除了 MHA、GQA，还知道哪些
+
+**答：**
+
+| 机制 | 核心思想 | KV Cache | 典型模型 |
+|------|---------|---------|---------|
+| **MHA** | 每个 Q head 有独立 KV head | n_h × d_h × 2 | GPT-3, LLaMA-1 |
+| **MQA** | 所有 Q head 共享 1 个 KV head | d_h × 2 | PaLM, Falcon |
+| **GQA** | 每组 Q head 共享 1 个 KV head | n_kv × d_h × 2 | LLaMA-2/3 |
+| **MLA** | KV 低秩压缩到 latent | d_c + d_rope | DeepSeek-V2/R1 |
+| **Linear Attention** | 用 kernel 替代 softmax，O(n) | 固定状态矩阵 | RWKV, Mamba |
+| **Sliding Window** | 只关注局部窗口内 token | 窗口大小 × 层数 | Mistral |
+| **Sparse Attention** | 稀疏注意力模式（local + global） | 取决于稀疏度 | BigBird, Longformer |
+| **Cross Attention** | Q 来自一个序列，KV 来自另一个 | - | T5, 多模态模型 |
+
+### 注意力机制类型（MHA MQA GQA）各自优缺点
+
+**答：**
+
+| 维度 | MHA | MQA | GQA |
+|------|-----|-----|-----|
+| **Q heads** | h | h | h |
+| **KV heads** | h | 1 | g (1 < g < h) |
+| **KV Cache** | 最大 | 最小 | 中间 |
+| **模型质量** | 最好 | 有损失 | 接近 MHA |
+| **推理吞吐** | 最低 | 最高 | 中高 |
+| **典型配置** | 32Q/32KV | 32Q/1KV | 32Q/8KV |
+
+**选择指南：**
+- 追求质量 → MHA（参数充足时）
+- 追求推理效率 → MQA（可接受质量损失）
+- **平衡方案 → GQA**（目前最主流，LLaMA-2/3、Qwen-2+ 都用 GQA）
+
+### Transformer 底层原理，为啥能替代 RNN
+
+**答：**
+
+| 维度 | RNN/LSTM | Transformer |
+|------|----------|-------------|
+| **并行性** | 必须顺序处理（t 依赖 t-1） | 完全并行（所有 token 同时处理） |
+| **长距离依赖** | O(n) 路径，梯度易消失 | O(1) 路径（任意 token 对直接交互） |
+| **训练效率** | 无法利用 GPU 并行 | 矩阵乘法天然适合 GPU |
+| **表达能力** | 受限于固定大小隐状态 | Attention 可关注任意 token |
+| **计算复杂度** | O(n × d²) | O(n² × d)（长序列时更贵） |
+
+**Transformer 能替代 RNN 的根本原因：**
+1. **Self-Attention 实现全局信息聚合**：任意两个 token 距离为 1（vs RNN 的 O(n)）
+2. **完全并行化**：训练速度快数十倍
+3. **Scaling Law 表现更好**：模型越大、数据越多，Transformer 的优势越明显
+4. **KV Cache 使推理可行**：虽然训练是 O(n²)，但推理通过缓存实现增量计算
+
+### FFN 层是干嘛的，为什么先升维再降维
+
+**答：**
+
+**FFN 的作用：** 对每个 token 独立做非线性变换（MHA 负责 token 间交互，FFN 负责单 token 的特征变换）。
+
+```
+标准 FFN:    FFN(x) = W₂ · ReLU(W₁ · x + b₁) + b₂
+SwiGLU FFN:  FFN(x) = W₂ · (SiLU(W_gate · x) ⊙ W_up · x)
+
+W₁/W_up:  R^{d → 4d}    ← 升维
+W₂:       R^{4d → d}    ← 降维
+（SwiGLU 中 4d 变为 8d/3 × 2 ≈ 5.3d）
+```
+
+**为什么先升维再降维：**
+
+1. **信息瓶颈理论**：升维到更高维空间，非线性变换可以学习更复杂的模式；降维压缩回原始维度，迫使网络保留最重要的信息
+
+2. **类比**：
+   ```
+   d 维 → 4d 维：展开（把信息铺开，更容易做分离和变换）
+   激活函数：非线性筛选（保留有用信息，抑制无用信息）
+   4d 维 → d 维：压缩（把处理后的信息压回标准维度）
+   ```
+
+3. **参数量分配**：FFN 的参数量约占 Transformer 的 2/3（2 × d × 4d = 8d²），是模型"记忆知识"的主要载体
+
+### 梯度消失、梯度爆炸的根本原因
+
+**答：**
+
+**根本原因：链式法则中的连乘。**
+
+```
+反向传播中，梯度通过链式法则传播：
+∂L/∂w₁ = ∂L/∂hₙ × ∂hₙ/∂hₙ₋₁ × ... × ∂h₂/∂h₁ × ∂h₁/∂w₁
+         = ∂L/∂hₙ × Π_{i=1}^{n-1} ∂hᵢ₊₁/∂hᵢ × ∂h₁/∂w₁
+
+如果 |∂hᵢ₊₁/∂hᵢ| < 1（每层梯度 < 1）：
+  n 层连乘 → 梯度指数衰减 → 梯度消失
+
+如果 |∂hᵢ₊₁/∂hᵢ| > 1（每层梯度 > 1）：
+  n 层连乘 → 梯度指数增长 → 梯度爆炸
+```
+
+**具体触发场景：**
+
+| 问题 | 触发原因 |
+|------|---------|
+| **梯度消失** | Sigmoid/Tanh 在饱和区梯度 → 0；深层网络连乘；权重初始化过小 |
+| **梯度爆炸** | 权重矩阵特征值 > 1；学习率过大；RNN 长序列 |
+
+**解决方案：**
+- 残差连接（+1 保底）
+- LayerNorm/RMSNorm（稳定分布）
+- 合理初始化（Xavier/He）
+- 梯度裁剪（Gradient Clipping）
+- 使用 ReLU 族激活函数（正区梯度恒为 1）
+
+### ResNet 和 Transformer 中残差连接的作用
+
+**答：**
+
+**数学原理：**
+```
+无残差：y = F(x)        → dy/dx = dF/dx（可能很小）
+有残差：y = F(x) + x    → dy/dx = dF/dx + 1（至少为 1）
+
+"+1" 保证了梯度至少有一条直通路径，不会消失
+```
+
+**在 Transformer 中的三重作用：**
+
+1. **梯度高速公路**：梯度可以跳过中间层直接传到底层，解决深度网络的梯度消失
+
+2. **学习"增量"而非"全量"**：
+   ```
+   F(x) 学习的是"需要修改的部分"（delta/residual）
+   而不是从头学完整变换
+   → 优化更容易（学小的 delta 比学完整映射简单）
+   ```
+
+3. **支持更深的网络**：LLaMA-65B 有 80 层，没有残差连接根本训不动
+
+**Pre-Norm 变体（现代 LLM 标准）：**
+```
+y = x + Layer(Norm(x))    ← Pre-Norm：先归一化再变换
+vs
+y = Norm(x + Layer(x))    ← Post-Norm：先变换再归一化
+
+Pre-Norm 训练更稳定（梯度更平滑），Post-Norm 理论表达力更强
+```
+
+### 大模型位置编码方式、RoPE 相比传统正余弦编码的区别
+
+**答：**
+
+**常见位置编码方法：**
+
+| 方法 | 原理 | 外推能力 | 额外参数 | 代表模型 |
+|------|------|---------|---------|---------|
+| **正弦位置编码** | 固定 sin/cos 函数 | 差 | 无 | 原始 Transformer |
+| **可学习绝对编码** | 学习每个位置的 embedding | 无 | 有（max_len × d） | GPT-2 |
+| **相对位置编码（T5）** | 学习相对距离的 bias | 一般 | 有 | T5 |
+| **RoPE** | 旋转矩阵编码位置 | 好 | 无 | LLaMA, Qwen |
+| **ALiBi** | 基于距离的线性衰减 | 好 | 无 | BLOOM |
+
+**RoPE vs 传统正弦编码：**
+
+| 维度 | 正弦位置编码 | RoPE |
+|------|------------|------|
+| **编码方式** | 加到 token embedding 上 | 对 Q/K 做旋转 |
+| **位置信息** | 绝对位置 | **相对位置**（内积自然编码距离） |
+| **外推能力** | 差（超过训练长度性能骤降） | 较好（配合 NTK/YaRN 可大幅外推） |
+| **与 KV Cache** | 兼容 | **天然兼容**（K 已编码位置，可直接缓存） |
+| **前缀共享** | 不同绝对位置导致 KV 不同 | **相同前缀 KV 可复用** |
+
+**为什么用 RoPE：**
+1. 相对位置编码不依赖绝对位置 → 更好的泛化
+2. 无额外参数 → 简洁
+3. 与高效 attention（FlashAttention）和 KV Cache 完美兼容
+4. 通过 NTK-aware/YaRN 缩放可扩展到更长上下文
+
+### 为什么要用 LN，不用 BN
+
+**答：**
+
+| 维度 | Batch Normalization (BN) | Layer Normalization (LN) |
+|------|-------------------------|-------------------------|
+| **归一化维度** | 跨 batch，对每个特征 | 跨特征，对每个样本 |
+| **依赖 batch** | ✅ 需要一定 batch size | ❌ 独立于 batch |
+| **变长序列** | ❌ 不同位置统计量不同 | ✅ 每个 token 独立归一化 |
+| **推理时 batch=1** | 需要 running statistics | 直接计算，无问题 |
+| **自回归生成** | 不适用（batch=1 逐 token） | 完美适用 |
+
+**LN 在 LLM 中必须用的原因：**
+1. **自回归生成时 batch=1**：BN 退化（统计量不可靠）
+2. **序列长度动态变化**：BN 需要固定维度的统计量
+3. **分布式训练**：BN 需要跨 GPU 同步统计量，通信开销大
+
+**现代 LLM 实际用 RMSNorm**（简化版 LN）：
+```
+LN:      y = (x - μ) / √(σ² + ε) × γ + β    ← 减均值 + 除标准差
+RMSNorm: y = x / √(mean(x²) + ε) × γ         ← 只除 RMS，更快
+```
+
+### PreNorm 和 PostNorm 区别
+
+**答：**
+
+```
+PostNorm（原始 Transformer）:
+x → [MHA] → + x → [LayerNorm] → [FFN] → + → [LayerNorm]
+     ↑__________________|         ↑___________________|
+
+PreNorm（GPT/LLaMA/现代 LLM）:
+x → [LayerNorm] → [MHA] → + x → [LayerNorm] → [FFN] → +
+                    ↑______|                     ↑______|
+```
+
+| 维度 | PostNorm | PreNorm |
+|------|----------|---------|
+| **梯度稳定性** | 差（深层训练困难） | 好（残差路径不经过 Norm） |
+| **训练难度** | 高（需要 warmup 等技巧） | 低（开箱即用） |
+| **理论表达力** | 更强（Norm 在残差之后） | 略弱 |
+| **实际表现** | 浅层模型可能更好 | **深层模型显著更好** |
+| **谁在用** | 原始 Transformer, BERT | **GPT, LLaMA, Qwen, DeepSeek** |
+
+**面试关键点：** 现代 LLM 全部使用 PreNorm（+ RMSNorm），因为训练稳定性远比理论表达力重要。
+
+### LLM 中常用的激活函数
+
+**答：**
+
+| 激活函数 | 公式 | 特点 | 使用模型 |
+|---------|------|------|---------|
+| **ReLU** | max(0, x) | 简单，但有 dying neuron 问题 | 早期模型 |
+| **GELU** | x · Φ(x) | 平滑版 ReLU，概率解释 | BERT, GPT-2/3 |
+| **SiLU/Swish** | x · σ(x) | 平滑，自门控 | LLaMA |
+| **SwiGLU** | (SiLU(W_gate·x) ⊙ W_up·x) | **门控机制 + SiLU** | **LLaMA, Qwen, DeepSeek** |
+
+**为什么不用 Sigmoid/Tanh：**
+- Sigmoid：输出在 (0,1)，梯度在饱和区趋近 0 → 梯度消失
+- Tanh：输出在 (-1,1)，同样有饱和区问题
+- 两者的 exp 计算比 ReLU/SiLU 更昂贵
+
+**为什么 SwiGLU 成为主流：**
+```
+SwiGLU(x) = SiLU(x · W_gate) ⊙ (x · W_up)
+           = 门控信号 × 信息通道
+
+门控机制让网络学会"选择性地激活"，比纯激活函数更灵活
+PaLM 论文实验证明 SwiGLU > GELU > ReLU（同参数量下）
+```
+
+### 双向 attention、因果 attention 和 prefix-attention 的区别
+
+**答：**
+
+```
+双向 Attention（BERT）：
+Mask:  [1 1 1 1]     所有 token 都能看到所有 token
+       [1 1 1 1]
+       [1 1 1 1]
+       [1 1 1 1]
+
+因果 Attention（GPT/LLaMA）：
+Mask:  [1 0 0 0]     每个 token 只能看到自己和之前的
+       [1 1 0 0]
+       [1 1 1 0]
+       [1 1 1 1]
+
+Prefix Attention（T5 Decoder / Prefix-tuning）：
+Mask:  [1 1 1 0 0]   前缀部分双向 attention
+       [1 1 1 0 0]   生成部分因果 attention
+       [1 1 1 0 0]
+       [1 1 1 1 0]   ← 生成 token 能看前缀 + 已生成
+       [1 1 1 1 1]
+       prefix  gen
+```
+
+| 类型 | 上下文 | 适用场景 | 代表模型 |
+|------|--------|---------|---------|
+| **双向** | 全局 | 理解任务（分类、匹配） | BERT, RoBERTa |
+| **因果** | 仅历史 | 自回归生成 | GPT, LLaMA |
+| **Prefix** | 前缀双向 + 生成因果 | 条件生成、few-shot | T5, UniLM |
+
+### 什么是旋转位置编码（RoPE），解决了什么问题
+
+**答：**
+
+**RoPE（Rotary Position Embedding）** 通过对 Q/K 向量施加旋转来编码位置信息。
+
+**核心数学：**
+```
+将 d 维向量视为 d/2 个二维向量，对每对施加旋转：
+
+[q_{2i}  ]     [cos(mθ_i)  -sin(mθ_i)] [q_{2i}  ]
+[q_{2i+1}]  =  [sin(mθ_i)   cos(mθ_i)] [q_{2i+1}]
+
+其中 m 是位置，θ_i = 10000^{-2i/d} 是频率
+
+关键性质：
+<RoPE(q, m), RoPE(k, n)> = f(q, k, m-n)
+内积只依赖相对位置 (m-n)，不依赖绝对位置！
+```
+
+**解决的问题：**
+1. **相对位置编码**：无需显式学习 position bias，旋转自然编码相对距离
+2. **长度外推**：比绝对编码更好的外推能力（配合 NTK/YaRN 可从 4K 扩到 128K+）
+3. **KV Cache 友好**：K 在生成时已包含位置信息，缓存后不需重新编码
+4. **无额外参数**：不增加模型参数量
+5. **高效实现**：旋转操作可融合到 Q/K 投影中
+
+---
+
 ## 推荐使用方式
 
 如果你是为面试准备这份文档，建议按下面顺序读：
 
 1. 先读 `3, 4, 6, 7, 11`
 2. 再读 `2, 5, 9, 10`
-3. 最后补 `12, 13`
+3. 最后补 `12, 13, 15`
 
 因为：
 
 - `softmax / attention / FFN / norm / Adam` 是最高频
 - `RoPE / GQA / backward` 是常见追问
 - `MoE / FLOPs / KV cache` 是资深面试官加深题
+- `Transformer 架构题` 是基础必答题
 
 ---
 

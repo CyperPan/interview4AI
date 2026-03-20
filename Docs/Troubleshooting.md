@@ -6,6 +6,7 @@
 - [常见故障定位](#常见故障定位)
 - [扩展性分析](#扩展性分析)
 - [工程价值观](#工程价值观)
+- [Loss 突刺排查](#loss-突刺排查)
 
 ---
 
@@ -186,6 +187,66 @@ Stage 2: [Layer5][Layer6]
 
 ---
 
+## Loss 突刺排查
+
+### 训练中遇到 Loss 突刺（Spike）的排查思路
+
+**答：**
+
+Loss 突刺是大模型训练中常见的问题，排查需要系统性地从多个维度定位根因。
+
+**排查流程（按优先级）：**
+
+```
+Loss Spike!
+    │
+    ├─ 1. 数据层面 ──→ 检查当前 batch 的数据质量
+    │     • 是否有损坏/异常样本（乱码、超长、空白）
+    │     • 数据加载是否有 shuffle 异常（某个 batch 全是同类数据）
+    │     • 检查 DataLoader 是否有 bug（跳过数据、重复数据）
+    │
+    ├─ 2. 学习率 ──→ 检查 LR scheduler 状态
+    │     • Warmup 结束瞬间 LR 跳变
+    │     • Cosine decay 在某些位置的突变
+    │     • 手动调整 LR 后忘记同步到所有 rank
+    │
+    ├─ 3. 梯度爆炸 ──→ 检查 gradient norm
+    │     • 记录每步 grad_norm，spike 前是否已有增长趋势
+    │     • 是否开启了 gradient clipping（推荐 max_norm=1.0）
+    │     • 某些层梯度异常大（可能初始化问题或数据问题）
+    │
+    ├─ 4. 数值不稳定 ──→ 检查精度和 scaling
+    │     • FP16 训练：Loss Scaling 是否频繁触发 overflow → scale 剧烈振荡
+    │     • 检查是否有 NaN/Inf（在 loss、grad、param 中插入检查）
+    │     • 解决：切换 BF16 / 调大初始 loss scale / 降低 LR
+    │
+    ├─ 5. 硬件问题 ──→ 检查 GPU 和网络
+    │     • nvidia-smi -q 查看 ECC 错误、温度降频
+    │     • NVLink/RDMA 链路是否有间歇性故障
+    │     • 某张卡计算结果 silent corruption → 梯度异常
+    │
+    └─ 6. 分布式同步 ──→ 检查梯度聚合
+          • AllReduce 是否正确完成（有无 hang 或部分失败）
+          • 不同 rank 的 loss 是否一致
+          • PP 边界的激活传递是否有数值偏差
+```
+
+**常见解决方案：**
+
+| 方案 | 效果 | 适用场景 |
+|------|------|---------|
+| **Gradient Clipping** | 限制梯度幅度 | 必须开启（max_norm=1.0） |
+| **降低学习率** | 减小更新幅度 | Spike 频繁时 |
+| **跳过异常 batch** | 跳过 loss 异常大的 step | 数据质量问题 |
+| **切换 BF16** | 避免 FP16 溢出 | 数值不稳定 |
+| **增大 batch size** | 梯度估计更稳定 | 梯度方差大 |
+| **Checkpoint 回滚** | 恢复到 spike 前状态 | 严重崩溃时 |
+| **Z-loss 正则化** | 对 logits 幅度做正则 | PaLM 论文提出的方法 |
+
+**面试关键点：** 排查 loss spike 的核心思路是"分层定位"——先排除数据问题（最常见），再看数值稳定性，最后查硬件和分布式。工程中应该预先记录 grad_norm、loss_scale、learning_rate 等关键指标，事后分析。
+
+---
+
 ## 面试金句
 
 > "一看 top，CPU 满就是数据加载瓶颈；二看 Nsight Systems 的 Timeline：如果 GPU 呈现大块绿色的 Kernel 执行，就是算力瓶颈；如果大块红色的 NCCL Wait 或 cudaMemcpy，那就是通信或访存瓶颈。"
@@ -193,3 +254,5 @@ Stage 2: [Layer5][Layer6]
 > "工程稳定性绝对优先。不能稳定运行 24 小时的极致吞吐是毫无意义的。"
 
 > "分布式系统排错极其困难。先跑通小规模 Baseline，确保 Loss 正常收敛。在这个可复现的基础上，每次只引入一个优化，如果 Loss 对不上立刻回滚。这是顶尖 Infra 工程师的必修准则。"
+
+> "Loss Spike 排查顺序：数据质量 → 学习率 → 梯度爆炸 → 数值精度 → 硬件故障 → 分布式同步。90% 的 spike 是数据或数值问题。"

@@ -10,6 +10,7 @@
 - [量化 Quantization](#量化-quantization)
 - [CUDA 与 GPU 优化](#cuda-与-gpu-优化)
 - [大模型理论与推理优化](#大模型理论与推理优化)
+- [GPU 硬件与编程模型补充](#gpu-硬件与编程模型补充)
 
 ---
 
@@ -689,6 +690,199 @@ PagedAttention:
 
 ---
 
+## GPU 硬件与编程模型补充
+
+### H100 相比 A100 有哪些改进
+
+**答：**
+
+| 维度 | A100 (Ampere) | H100 (Hopper) | 改进倍数 |
+|------|--------------|---------------|---------|
+| **Tensor Core** | 第 3 代（FP16/BF16/TF32/INT8） | 第 4 代（新增 **FP8**） | ~3x FLOPS |
+| **BF16 峰值算力** | 312 TFLOPS | 990 TFLOPS | ~3.2x |
+| **FP8 峰值算力** | 不支持 | 1979 TFLOPS | 全新 |
+| **NVLink** | 第 3 代，600 GB/s | 第 4 代，**900 GB/s** | 1.5x |
+| **HBM** | HBM2e，2.0 TB/s，80GB | HBM3，**3.35 TB/s**，80GB | 1.67x |
+| **L2 Cache** | 40 MB | **50 MB** | 1.25x |
+| **SM 数量** | 108 | 132 | 1.22x |
+
+**Hopper 架构关键新特性：**
+
+1. **Transformer Engine**：硬件级自动 FP8 混合精度，自动选择 FP8/FP16 粒度
+2. **Thread Block Clusters**：多个 Block 可组成 Cluster，共享跨 SM 的数据（Distributed Shared Memory）
+3. **TMA（Tensor Memory Accelerator）**：硬件异步搬运多维张量，解放 SM 做计算
+4. **DPX 指令**：加速动态规划类算法
+5. **Confidential Computing**：硬件级 AI 安全保护
+
+**面试重点：** H100 对 LLM 最重要的改进是 FP8 Tensor Core + TMA + 更高 NVLink 带宽，使得 FlashAttention-3 和 FP8 训练成为可能。
+
+### Triton 和 CUDA 区别
+
+**答：**
+
+| 维度 | CUDA | Triton |
+|------|------|--------|
+| **开发者** | NVIDIA | OpenAI |
+| **编程语言** | C/C++ + CUDA 扩展 | **Python** |
+| **抽象级别** | 低（手动管理线程、共享内存、同步） | 高（自动 tiling、自动共享内存管理） |
+| **控制粒度** | Thread 级别 | **Block (tile) 级别** |
+| **内存管理** | 手动（shared memory load/store） | 自动（编译器优化 tiling 和缓存） |
+| **编译目标** | PTX → SASS | MLIR → PTX → SASS |
+| **学习曲线** | 陡峭 | 平缓 |
+| **性能上限** | 最高（手工极致优化） | 接近 CUDA（通常 80-95%） |
+| **调试难度** | 高 | 中等 |
+| **生态** | 最成熟，文档/工具丰富 | 快速发展，PyTorch 生态集成 |
+
+**Triton 核心思想：**
+```python
+# Triton: 以 block/tile 为粒度编程
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)  # 获取 block ID
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)  # 自动向量化
+    mask = offsets < n
+    x = tl.load(x_ptr + offsets, mask=mask)  # 自动合并访存
+    y = tl.load(y_ptr + offsets, mask=mask)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+```
+
+**选择建议：**
+- **写自定义 kernel（Flash Attention 变体、融合算子）**：优先 Triton（开发效率高）
+- **极致性能优化（最后 5-10%）**：CUDA
+- **需要 Warp 级控制（warp shuffle、inline PTX）**：只能 CUDA
+
+### BLOCK SIZE 选择原则
+
+**答：**
+
+BLOCK SIZE（每个 Block 的线程数）直接影响 GPU 利用率，通常选择 **64、128 或 256**。
+
+**权衡因素：**
+
+| 因素 | BLOCK SIZE 过小 | BLOCK SIZE 过大 |
+|------|----------------|----------------|
+| **Occupancy** | Wave 内 block 多，但每 block 线程少 | 每 block 用 register/shared memory 多，SM 能放的 block 少 |
+| **Register 压力** | 低 | 高（可能溢出到 local memory） |
+| **Shared Memory** | 用量少 | 用量大，限制并发 block 数 |
+| **Warp 数量** | 少，难以隐藏延迟 | 多，更好隐藏 memory latency |
+| **计算粒度** | Tile 小，数据复用低 | Tile 大，数据复用好 |
+
+**实践指南：**
+
+```
+1. 确保 BLOCK SIZE 是 Warp 大小(32) 的倍数
+2. 查看 SM 资源限制：
+   - Register: 每 SM 65536 个，每 thread 使用 N 个 → 最多 65536/N 个 thread
+   - Shared Memory: 每 SM 48-164KB
+3. 使用 CUDA Occupancy Calculator 计算最优值
+
+常见选择：
+- GEMM kernel: 128 或 256（需要大 tile 做数据复用）
+- Elementwise kernel: 256 或 512（简单计算，追求高占用率）
+- Reduction kernel: 256（平衡并行度和同步开销）
+```
+
+### CUDA Tile 编程模型
+
+**答：**
+
+Tiling 是 GPU 编程的核心思想：将大规模计算分解为适合 SRAM 的小块（tile），减少对全局内存的访问。
+
+**基本模式：**
+
+```
+全局内存 (HBM)          共享内存 (SRAM)          寄存器
+┌──────────┐           ┌──────────┐           ┌──────┐
+│ A[M×K]   │ ──load──→ │ As[T×T]  │ ──load──→ │ 计算  │
+│ B[K×N]   │           │ Bs[T×T]  │           │ 结果  │
+│ C[M×N]   │ ←─store── │ Cs[T×T]  │ ←─store── │      │
+└──────────┘           └──────────┘           └──────┘
+```
+
+**GEMM Tiling 经典实现（C = A × B）：**
+
+```cuda
+// 每个 Block 计算 C 的一个 TILE_M × TILE_N 子块
+__global__ void gemm_tiled(float* A, float* B, float* C, int M, int N, int K) {
+    __shared__ float As[TILE_M][TILE_K];  // A 的 tile 缓存
+    __shared__ float Bs[TILE_K][TILE_N];  // B 的 tile 缓存
+    float acc = 0.0f;  // 寄存器累加
+
+    for (int t = 0; t < K; t += TILE_K) {
+        // Step 1: 从全局内存加载 tile 到共享内存
+        As[ty][tx] = A[row * K + (t + tx)];
+        Bs[ty][tx] = B[(t + ty) * N + col];
+        __syncthreads();  // 等待所有线程加载完成
+
+        // Step 2: 在共享内存中计算（数据复用）
+        for (int k = 0; k < TILE_K; k++)
+            acc += As[ty][k] * Bs[k][tx];
+        __syncthreads();  // 等待计算完成再加载下一个 tile
+    }
+
+    // Step 3: 写回全局内存
+    C[row * N + col] = acc;
+}
+```
+
+**为什么 Tiling 有效：**
+- 全局内存访问 A 的同一行被 TILE_N 个线程复用 → 减少 TILE_N 倍访存
+- 共享内存带宽 ~19 TB/s vs HBM ~3.35 TB/s → 快 ~5-6 倍
+- FlashAttention 本质就是 Attention 的 Tiling 实现
+
+**高级 Tiling 技巧：**
+1. **双缓冲（Double Buffering）**：加载下一个 tile 同时计算当前 tile
+2. **寄存器分块（Register Tiling）**：每个线程计算多个输出元素
+3. **Warp 级 Tiling**：利用 Tensor Core 的 wmma 指令
+
+### 介绍下 Ray 框架
+
+**答：**
+
+**Ray** 是 UC Berkeley RISELab（现 Anyscale 公司）开发的分布式计算框架，核心特点是**统一的分布式 API**。
+
+**核心组件：**
+
+| 组件 | 功能 | 典型用途 |
+|------|------|---------|
+| **Ray Core** | Task（无状态函数）+ Actor（有状态对象）的分布式抽象 | 通用分布式计算 |
+| **Ray Train** | 分布式训练 | 多 GPU/多节点训练 |
+| **Ray Serve** | 模型推理服务 | 在线 serving |
+| **Ray Data** | 分布式数据处理 | 数据预处理流水线 |
+| **RLlib** | 分布式强化学习 | RL 训练 |
+
+**为什么在 LLM 领域重要：**
+
+```
+传统 RL 训练：
+手动管理 Actor/Critic/Reward/Reference 4 个模型的分布式调度 → 工程量巨大
+
+Ray 方案（如 OpenRLHF）：
+@ray.remote(num_gpus=4)
+class ActorWorker:
+    def generate(self, prompts): ...
+    def train_step(self, batch): ...
+
+@ray.remote(num_gpus=2)
+class RewardWorker:
+    def score(self, responses): ...
+
+# Ray 自动处理调度、通信、容错
+futures = [actor.generate.remote(batch) for batch in batches]
+results = ray.get(futures)
+```
+
+**Ray 的核心优势：**
+1. **动态资源调度**：按需分配 GPU，训练和推理资源可动态切换
+2. **容错恢复**：Worker 失败自动重启
+3. **灵活编排**：不同模型可以用不同并行策略
+4. **Python 原生**：API 简洁，学习成本低
+5. **生态丰富**：与 PyTorch、vLLM、DeepSpeed 等集成
+
+**在 RLHF 中的应用：** OpenRLHF、veRL 等框架使用 Ray 编排 PPO/GRPO 训练中的多模型协作，Actor 生成、Reward 打分、Critic 评估可以在不同 GPU 组上并行执行。
+
+---
+
 ## 面试金句
 
 > "FlashAttention 解决的是 Attention 计算中的 HBM 瓶颈，通过分块计算减少显存访问；PagedAttention 解决的是 KV Cache 显存分配碎片问题，通过虚拟内存分页机制提高利用率。两者互补，可叠加使用。"
@@ -696,3 +890,9 @@ PagedAttention:
 > "SmoothQuant 的核心思想是通过数学等价变换，将激活中的异常值平滑到权重上，让两者都落入适合 INT8 量化的范围。"
 
 > "BF16 和 FP16 内存占用相同，但 BF16 有更大的动态范围（与 FP32 相同），数值稳定性更好，训练时不需要 Loss Scaling。"
+
+> "H100 相比 A100 的核心提升：FP8 Tensor Core（算力 2x）、第 4 代 NVLink（900GB/s）、HBM3（3.35TB/s）、TMA 异步搬运，使 FlashAttention-3 和 FP8 训练成为可能。"
+
+> "Triton 是 Python 级的 GPU 编程语言，以 Block/Tile 为粒度编程，自动处理 tiling 和内存管理，开发效率远高于 CUDA，性能可达 CUDA 的 80-95%。"
+
+> "CUDA Tile 编程的核心：将大计算分解为适合 SRAM 的小块，从全局内存加载 → 共享内存计算 → 写回全局内存，通过数据复用减少访存次数。"
