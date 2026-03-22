@@ -11,6 +11,7 @@
 - [CUDA 与 GPU 优化](#cuda-与-gpu-优化)
 - [大模型理论与推理优化](#大模型理论与推理优化)
 - [GPU 硬件与编程模型补充](#gpu-硬件与编程模型补充)
+- [CUDA 编程进阶面试题](#cuda-编程进阶面试题)
 
 ---
 
@@ -891,8 +892,210 @@ results = ray.get(futures)
 
 > "BF16 和 FP16 内存占用相同，但 BF16 有更大的动态范围（与 FP32 相同），数值稳定性更好，训练时不需要 Loss Scaling。"
 
+## CUDA 编程进阶面试题
+
+### 什么是 Coalesced Memory Access（合并访存）
+
+**答：**
+
+GPU 访问 HBM 不是按单个字节读的，而是按 **128 字节的 cache line** 为单位读取。
+
+**Coalesced Access（合并访存）：** 同一个 warp 的 32 个 thread 访问连续内存地址，硬件合并成一次或几次 cache line 读取。带宽利用率接近 100%。
+
+**Non-Coalesced Access（非合并访存）：** 32 个 thread 访问分散地址，每个请求落在不同 cache line，搬了大量数据但只用其中一小部分。带宽利用率可能低到 3%。
+
+```cuda
+// ✅ Coalesced：相邻 thread 读相邻地址
+float val = A[threadIdx.x];  // thread 0 读 A[0], thread 1 读 A[1]...
+// 32 个 thread 的请求合并成 1 次 cache line 事务
+
+// ❌ Non-Coalesced：相邻 thread 读间隔地址
+float val = A[threadIdx.x * stride];  // thread 0 读 A[0], thread 1 读 A[1024]...
+// 32 次独立 cache line 事务，搬 32×128=4096 字节，只用 128 字节，浪费 97%
+```
+
+**性能影响：** coalesced vs non-coalesced 可以差 **10-30 倍**。这就是为什么 MatMul 要用 tiling + shared memory——先按合并模式从 HBM 搬到 shared memory，shared memory 里随便怎么跳都很快。
+
+### 什么是 Warp Divergence
+
+**答：**
+
+GPU 执行单位是 warp（32 个连续 thread），同一 warp 必须在同一时刻执行同一条指令（SIMT）。
+
+**当 warp 内 thread 走不同 if/else 分支时：** 硬件只能串行执行两条路径——先让走 if 的 thread 执行（其余闲等），再让走 else 的 thread 执行（其余闲等）。
+
+```cuda
+// ❌ Warp Divergence：同一 warp 内一半走 if，一半走 else
+if (threadIdx.x % 2 == 0) {
+    C[i] = A[i] + B[i];    // 16 个 thread 执行，16 个闲等
+} else {
+    C[i] = A[i] - B[i];    // 16 个 thread 执行，16 个闲等
+}
+// 执行时间 = 两条路径之和，效率减半
+
+// ✅ 无 Divergence：分支以 warp 为单位对齐
+if (threadIdx.x / 32 == 0) {
+    // warp 0 全部走这里
+} else {
+    // warp 1 全部走这里 → 不同 warp 走不同路径完全没问题
+}
+```
+
+**向量加法的边界检查 `if (i < N)` 影响很小：** 只有最后一个 block 的最后一个 warp 可能 divergence，其他 warp 全部满足条件。
+
+### Block 内 Reduction 的完整实现
+
+**答：**
+
+Reduction（求和/求 max）是几乎所有 kernel 的基础（RMSNorm 求平方和、Softmax 求 max 和 sum 都依赖它）。256 个 thread 怎么高效地把 256 个数加成 1 个数：
+
+**两阶段方案：Warp Shuffle + Shared Memory**
+
+```
+阶段一：Warp 内 Shuffle（8 个 warp 各自内部归约）
+  256 个 thread → 8 个 warp，每个 warp 32 个 thread
+  Warp Shuffle 过程（以一个 warp 为例）：
+    32 个值
+    → 第1轮：跟距离16的 thread 交换并相加 → 16个有效值
+    → 第2轮：跟距离8的交换并相加 → 8个
+    → 第3轮：距离4 → 4个
+    → 第4轮：距离2 → 2个
+    → 第5轮：距离1 → 1个
+  5 轮完成，warp 内 32 个数归约成 1 个 partial sum
+
+  8 个 warp 得到 8 个 partial sum
+
+阶段二：跨 Warp 归约（通过 Shared Memory）
+  8 个 partial sum 写入 shared memory
+  → 1 个 warp 读出 8 个值
+  → 再做一轮 warp shuffle → 最终结果
+  → thread 0 广播给所有 thread
+```
+
+**为什么不全用 Shared Memory：** warp shuffle 在寄存器间直接交换，不需要 `__syncthreads()` 同步，延迟更低。
+
+**为什么不全用 Warp Shuffle：** shuffle 只能在 32 个 thread 的 warp 内部工作，跨 warp 必须经过 shared memory。
+
+### SM（Streaming Multiprocessor）和 Occupancy
+
+**答：**
+
+**SM 是 GPU 的基本计算单元**，每个 SM 包含 CUDA Core、Tensor Core、寄存器文件、Shared Memory、Warp Scheduler。
+
+| GPU | SM 数量 | 每 SM 寄存器 | 每 SM Shared Memory |
+|-----|--------|-------------|-------------------|
+| A100 | 108 | 256KB | 164KB（可配置） |
+| H100 | 132 | 256KB | 228KB（可配置） |
+
+**SM 和 Block 的关系：**
+- 一个 Block 被分配到**一个 SM** 上执行，不会迁移
+- 一个 SM 可以**同时运行多个 Block**（取决于资源）
+- 不同 Block 之间不能通过 Shared Memory 通信（可能在不同 SM 上）
+
+**Occupancy = SM 上实际活跃 warp 数 / SM 最大支持 warp 数**
+
+```
+Occupancy 低的原因：
+1. Block 用了太多寄存器 → SM 放不下多个 Block → warp 少 → 无法隐藏延迟
+2. Block 用了太多 Shared Memory → 同理
+3. Block 的 thread 数太少 → warp 少
+
+Occupancy 不一定越高越好：
+- 有时低 occupancy 但每个 thread 用更多寄存器可以减少 memory spill
+- 关键看整体吞吐，不是单一指标
+- 但通常 occupancy > 50% 是比较健康的
+```
+
+### CUDA 向量加法 Kernel（入门必会）
+
+**答：**
+
+```cuda
+// Kernel 函数
+__global__ void vector_add(float* A, float* B, float* C, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  // 全局索引
+    if (i < N) {                                      // 边界检查
+        C[i] = A[i] + B[i];
+    }
+}
+
+// 主机端调用
+int block_size = 256;
+int grid_size = (N + block_size - 1) / block_size;  // 向上取整
+vector_add<<<grid_size, block_size>>>(A, B, C, N);
+```
+
+**关键概念：**
+- `blockIdx.x * blockDim.x + threadIdx.x`：全局唯一编号
+- 最后一个 block 有多余 thread（如 N=100000, 391×256=100096），多出 96 个 thread 通过 `if (i < N)` 跳过
+
+**所有复杂 kernel 都是在这个模式上扩展：** RMSNorm 加 reduction、Softmax 加三趟扫描、MatMul 加 tiling。
+
+### Softmax Kernel 的三趟扫描
+
+**答：**
+
+手写 Softmax kernel 需要三趟扫描，每趟是一次 block 内 reduction：
+
+```
+第一趟：求 max（数值稳定性）
+  扫描整行，找最大值 m = max(x)
+  → block 内 reduction（warp shuffle + shared memory）
+
+第二趟：求 exp 之和
+  再扫描一遍，算 sum = Σ exp(x_i - m)
+  → block 内 reduction
+
+第三趟：归一化
+  再扫描一遍，算 softmax(x_i) = exp(x_i - m) / sum
+  → 逐元素计算，无需 reduction
+```
+
+**为什么不能合并：** 第二趟需要第一趟的全局 max，第三趟需要第二趟的全局 sum。每趟都依赖上一趟的全局结果。
+
+**Online Softmax 的改进：** 通过维护 running max + running sum 加修正系数 `exp(old_max - new_max)`，把三趟压缩成一趟。FlashAttention 正是靠这个实现分块流式计算。
+
+### MatMul 的 Tiling + Shared Memory 详解
+
+**答：**
+
+**没有 Shared Memory 的问题：**
+
+计算 C 的一个 32×32 小块时，A 的同一行被 32 个 thread 重复读（因为它们算 C 同一行的不同列），大量冗余 HBM 读取。
+
+**Tiling + Shared Memory 的做法：**
+
+```cuda
+for each tile along K dimension:
+    // Step 1: 所有 thread 协作，把 A 和 B 各一个 tile 从 HBM 搬到 Shared Memory
+    As[ty][tx] = A[row * K + (t + tx)];
+    Bs[ty][tx] = B[(t + ty) * N + col];
+    __syncthreads();
+
+    // Step 2: 在 Shared Memory 内做计算（数据被多个 thread 复用）
+    for (int k = 0; k < TILE_K; k++)
+        acc += As[ty][k] * Bs[k][tx];
+    __syncthreads();
+
+// Step 3: 写回 HBM
+C[row * N + col] = acc;
+```
+
+**为什么有效：**
+- A 的 tile 从 HBM 只读 **1 次**到 Shared Memory，然后被 32 个 thread **复用 32 次**
+- HBM 读取量下降一个数量级
+- 本质：用高带宽的片上存储（19 TB/s）换低带宽的 HBM 访问（2-3 TB/s）
+
+---
+
+## 面试金句
+
 > "H100 相比 A100 的核心提升：FP8 Tensor Core（算力 2x）、第 4 代 NVLink（900GB/s）、HBM3（3.35TB/s）、TMA 异步搬运，使 FlashAttention-3 和 FP8 训练成为可能。"
 
 > "Triton 是 Python 级的 GPU 编程语言，以 Block/Tile 为粒度编程，自动处理 tiling 和内存管理，开发效率远高于 CUDA，性能可达 CUDA 的 80-95%。"
 
 > "CUDA Tile 编程的核心：将大计算分解为适合 SRAM 的小块，从全局内存加载 → 共享内存计算 → 写回全局内存，通过数据复用减少访存次数。"
+
+> "Coalesced access 是同一 warp 的 32 个 thread 访问连续内存地址，硬件合并成少量 cache line 事务。Non-coalesced 地址分散，性能差距 10-30 倍。"
+
+> "Block 内 reduction 标准做法：warp 内用 shuffle 归约（寄存器级，无需同步），跨 warp 用 shared memory 中转。两阶段结合兼顾速度和通用性。"

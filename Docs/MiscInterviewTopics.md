@@ -15,6 +15,9 @@
 - [Adam 与 AdamW](#adam-与-adamw)
 - [大模型常见问题与解决方案](#大模型常见问题与解决方案)
 - [超长上下文](#超长上下文)
+- [量化进阶](#量化进阶)
+- [混合精度训练详解](#混合精度训练详解)
+- [编译器与计算库基础](#编译器与计算库基础)
 
 ---
 
@@ -536,6 +539,135 @@ YaRN 三步：
 
 ---
 
+## 量化进阶
+
+### 对称量化和非对称量化的区别
+
+**答：**
+
+| 维度 | 对称量化 | 非对称量化 |
+|------|---------|-----------|
+| **参数** | 只需 scale | 需要 scale + zero_point |
+| **公式** | x_q = round(x / scale) | x_q = round(x / scale) + zero_point |
+| **反量化** | x ≈ x_q × scale | x ≈ (x_q - zero_point) × scale |
+| **零点映射** | 0 → 0（零点固定） | 0 可映射到任意位置 |
+| **INT8 范围** | [-127, 127] | [0, 255] |
+
+**各自适合的场景：**
+- **权重**：通常对称分布（接近正态，均值 ≈ 0）→ **对称量化**，实现简单，MatMul kernel 不需处理 zero_point
+- **Activation**：经常不对称（ReLU 后全正，某些 channel 偏移大）→ **非对称量化**，精度更好
+
+**常见组合：W8A8 = 权重对称量化 + activation 非对称量化。**
+
+### AWQ 详解：为什么看 Activation 而不是权重大小
+
+**答：**
+
+**AWQ = Activation-aware Weight Quantization**，核心看的是 activation magnitude，不是权重本身的大小。
+
+**原因：** 量化误差的影响 = 权重误差 × activation。同样的量化误差，activation 大的 channel 输出偏差更大。所以要保护的不是"大权重"，而是"被大 activation 乘的权重"。
+
+**做法：**
+```
+1. 跑校准数据 → 统计每个 channel 的 activation magnitude
+2. magnitude 大的 channel → 对应权重乘 scale 放大
+3. 量化放大后的权重（相对精度损失更小）
+4. 推理时 activation 侧除以同一个 scale 补偿
+
+数学等价：W_q = Quantize(W × s) / s
+         Y = X @ W = (X / s) @ (W × s) → 结果不变
+```
+
+---
+
+## 混合精度训练详解
+
+### 混合精度训练原理和 Loss Scaling
+
+**答：**
+
+**标准做法：FP16/BF16 + FP32 混合（不是 INT8/INT4，那是推理量化）。**
+
+```
+每一步训练：
+1. FP32 权重 → 拷贝一份转 FP16
+2. 用 FP16 做前向和反向 → 得到 FP16 梯度（快，省显存）
+3. FP16 梯度转回 FP32
+4. 用 FP32 梯度更新 FP32 权重主副本（精度保障）
+5. 回到 1
+```
+
+**为什么不能全用 FP16：**
+1. **梯度下溢**：FP16 最小正数 ~5.96e-8，很多梯度（如 1e-10）直接变 0，模型学不动
+2. **更新被吞掉**：权重=1.0，更新量=1e-7 → FP16 下 1.0+1e-7=1.0（精度不够，被舍入）
+3. **Loss 溢出**：FP16 最大值 ~65504，中间激活值可能超出变成 inf
+
+**Loss Scaling 解决下溢：**
+```python
+# 前向：放大 loss
+scaled_loss = loss * scale_factor  # 如 ×1024
+scaled_loss.backward()              # 梯度也被放大 1024 倍 → 小梯度不下溢
+
+# 更新前：缩回来
+if grad.is_inf_or_nan():
+    scale_factor /= 2              # 溢出了就减小
+else:
+    grads /= scale_factor           # 恢复真实值
+    optimizer.step()
+    scale_factor *= 2              # 没问题就逐步放大
+```
+
+**BF16 趋势：** 8-bit 指数 → 范围与 FP32 相同，不容易溢出，大多数情况不需要 Loss Scaling。现代大模型训练主流用 **BF16 + FP32 混合**。
+
+---
+
+## 编译器与计算库基础
+
+### TVM 在 AI 推理中的角色
+
+**答：**
+
+```
+类比：
+  C 代码 → GCC/Clang 编译器 → x86 机器码
+  PyTorch 模型 → TVM 编译器 → CUDA kernel / 昆仑芯片指令 / ARM 指令
+```
+
+| 维度 | 手写 CUDA | TVM |
+|------|----------|-----|
+| **性能上限** | 最高 | 接近（90-95%） |
+| **开发效率** | 极低（几百行） | 高（自动生成） |
+| **可移植性** | 只能跑 NVIDIA | 可编译到任何硬件 |
+| **适用场景** | 极致优化热点算子 | 快速适配多种硬件 |
+
+**TVM 的两级优化：**
+- **图级别**：算子融合、常量折叠、死代码消除
+- **算子级别**：自动搜索最优 tiling/loop 策略（AutoTVM / Ansor）
+
+**为什么对百度重要：** 百度有自研昆仑芯片，TVM 类编译器可以让同一模型自动编译到 GPU 和昆仑上，大幅降低适配成本。
+
+### cuBLAS 和主流计算库速记
+
+**答：**
+
+| 库 | 硬件 | 用途 | 典型调用 |
+|----|------|------|---------|
+| **cuBLAS** | NVIDIA GPU | 矩阵乘法（GEMM） | PyTorch `F.linear()` 底层 |
+| **cuDNN** | NVIDIA GPU | DL 原语（Conv, BN, Pooling） | PyTorch Conv2d 底层 |
+| **CUTLASS** | NVIDIA GPU | 可定制的 GEMM 模板库 | 融合 dequant + MatMul |
+| **MKL** | Intel CPU | CPU 数学加速 | NumPy 底层 |
+| **OpenBLAS** | CPU（通用） | 开源 CPU 线性代数 | MKL 的开源替代 |
+| **Eigen** | CPU | C++ 模板线性代数 | 小矩阵、CPU 端推理 |
+| **MIOpen** | AMD GPU | AMD 版 cuDNN | ROCm 生态 |
+
+**面试追问"既然 cuBLAS 很快为什么还要自己写"的答法：**
+通用 MatMul 确实用 cuBLAS，但某些场景需要自定义 kernel：
+- dequant + MatMul 融合（cuBLAS 不支持）
+- 小 batch decode 的针对性优化
+- 非标准 layout 的矩阵运算
+
+---
+
 ## 面试金句
 
 > "Agent 的核心是 LLM + Tools + Memory + Planning，本质是把 LLM 从'回答问题'升级为'完成任务'。"
@@ -547,3 +679,9 @@ YaRN 三步：
 > "超长上下文三条路：位置编码扩展（YaRN）、注意力优化（稀疏/滑窗）、系统层面（序列并行/KV 压缩）。工程中最常用的其实是 RAG。"
 
 > "Chinchilla Scaling Law 说最优是 20 倍 token/参数，但实际训练远超此数——因为我们优化的是推理效率，不是训练效率。"
+
+> "AWQ 看的是 activation magnitude 而非权重大小。同样的量化误差，被大 activation 乘的权重影响更大，所以要保护的是'被大 activation 乘的权重'。"
+
+> "混合精度训练 = FP16/BF16 做前向反向提速 + FP32 保留权重和优化器状态保精度。Loss Scaling 解决 FP16 梯度下溢。BF16 因范围大（同 FP32）逐渐成为主流。"
+
+> "Roofline Model：算出 kernel 的 arithmetic intensity，跟硬件算力带宽比比较。Decode Linear AI≈1 远低于 A100 拐点 156，是 memory-bound。"
