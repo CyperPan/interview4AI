@@ -5,6 +5,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg" alt="LICENSE"></a>
 </p>
 
+网站版现已上线:https://zhiyuanblog.org/
 ---
 
 ## 💡 关于
